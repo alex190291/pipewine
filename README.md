@@ -227,7 +227,7 @@ With requirements:
 - **🐛 Bug Reports**: [GitHub Issues](https://github.com/yourusername/pipewine/issues)
 - **💬 Discussions**: [GitHub Discussions](https://github.com/yourusername/pipewine/discussions)
 - **📚 Documentation**: [Project Wiki](https://github.com/yourusername/pipewine/wiki)
-- **📧 Email**: support@pipewine.org
+- **📧 Email**: attax@nosinu-records.com
 
 ## 🌟 Star History
 

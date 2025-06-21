@@ -171,7 +171,7 @@ sudo cp build64/libpwasio_gui.so /usr/lib64/wine/x86_64-unix/
 
 ## 🤝 Contributing
 
-We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
+We welcome contributions!
 
 ### Development Setup
 ```bash

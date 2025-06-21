@@ -67,15 +67,6 @@ wine64 VBASIOTest64.exe
 # Launch your DAW and select "PipeWine" as ASIO driver
 wine64 ~/.wine/drive_c/path/to/your/daw.exe
 ```
-
-## 📖 Documentation
-
-- **[Build Instructions](BUILD.md)** - Complete building and installation guide
-- **[Configuration Guide](docs/configuration.md)** - Detailed configuration options
-- **[Performance Tuning](docs/performance.md)** - Optimization tips and tricks
-- **[Troubleshooting](docs/troubleshooting.md)** - Common issues and solutions
-- **[API Documentation](docs/api.md)** - Technical implementation details
-
 ## ⚙️ Configuration
 
 ### Quick Configuration

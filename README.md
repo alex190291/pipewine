@@ -15,14 +15,14 @@ PipeWine is a high-performance ASIO (Audio Stream Input/Output) driver that enab
 
 ## ✨ Features
 
-### 🎯 **Professional Audio Performance**
-- **Ultra-low latency**: As low as 5.33ms at 48kHz with 256-sample buffers
+### 🎯 **Audio Performance**
+- **Low latency** audio processing capabilities
 - **Real-time audio processing** with dedicated Wine thread marshalling
 - **Professional buffer management** with cache-aligned allocation
-- **Automatic quantum synchronization** between PipeWire and ASIO
+- **Manual quantum synchronization** (requires matching PipeWire and ASIO settings)
 
 ### 🎛️ **Flexible Configuration**
-- **GUI control panel** for easy configuration
+- **GUI control panel** (currently has issues, under development)
 - **File-based configuration** system (`pipewine.conf`)
 - **Real-time parameter changes** without application restart
 - **Multiple configuration locations** (user and system-wide)
@@ -35,12 +35,9 @@ PipeWine is a high-performance ASIO (Audio Stream Input/Output) driver that enab
 - **Memory leak prevention** with comprehensive buffer management
 
 ### 🖥️ **Application Compatibility**
-- **Ableton Live** ✅
-- **FL Studio** ✅  
-- **Reaper** ✅
-- **Cubase** ✅
-- **Studio One** ✅
-- **Any ASIO-compatible application** ✅
+- **VBASIOTest64** ✅ (Tested and working)
+- **Ableton Live 11** ✅ (Tested and working)
+- **Other applications** ❓ (Not yet tested - compatibility unknown)
 
 ## 🚀 Quick Start
 
@@ -104,24 +101,24 @@ auto_connect = true
 rt_priority = 10
 ```
 
+**Important**: After changing buffer_size in configuration, set PipeWire quantum to match:
+```bash
+# Set PipeWire quantum to match buffer size
+pw-metadata -n settings 0 clock.quantum 512
+```
+
 ## 🎵 Audio Applications
 
 ### Tested Applications
 | Application | Status | Notes |
 |-------------|--------|-------|
-| Ableton Live 11 | ✅ Perfect | Full functionality, low latency |
-| FL Studio 21 | ✅ Perfect | All features working |
-| Reaper 7 | ✅ Perfect | Excellent performance |
-| Cubase 13 | ✅ Good | Minor GUI quirks |
-| Studio One 6 | ✅ Good | Works well |
+| VBASIOTest64 | ✅ Working | Basic ASIO functionality confirmed |
+| Ableton Live 11 | ✅ Working | Successfully tested with audio playback |
 
-### Performance Benchmarks
-| Buffer Size | Latency (48kHz) | CPU Usage | Stability |
-|-------------|-----------------|-----------|-----------|
-| 128 samples | 2.67ms | Low | Excellent |
-| 256 samples | 5.33ms | Very Low | Excellent |
-| 512 samples | 10.67ms | Minimal | Excellent |
-| 1024 samples | 21.33ms | Minimal | Excellent |
+### Performance Notes
+- Performance benchmarks are not yet available
+- Latency depends on buffer size configuration and PipeWire quantum settings
+- **Important**: PipeWire quantum must be manually set to match ASIO buffer size for optimal performance
 
 ## 🛠️ Building from Source
 
@@ -161,16 +158,23 @@ wine64 regsvr32 pipewine64.dll
 
 **Q: High latency or audio dropouts**
 ```bash
-# Set optimal PipeWire quantum
+# Set PipeWire quantum to match your ASIO buffer size
+# For 512 sample buffer:
 pw-metadata -n settings 0 clock.quantum 512
 
-# Reduce buffer size in configuration
-echo "buffer_size = 256" >> ~/.config/pipewine/pipewine.conf
+# For 256 sample buffer:
+pw-metadata -n settings 0 clock.quantum 256
+
+# Configure matching buffer size in pipewine.conf
+echo "buffer_size = 512" >> ~/.config/pipewine/pipewine.conf
 ```
 
-**Q: GUI not opening**
+**Q: GUI not opening or has issues**
 ```bash
-# Ensure GUI library is installed
+# Note: GUI currently has known issues and is under development
+# For now, use configuration file or registry settings instead
+
+# Ensure GUI library is installed (if attempting to use GUI)
 sudo cp build64/libpwasio_gui.so /usr/lib64/wine/x86_64-unix/
 ```
 

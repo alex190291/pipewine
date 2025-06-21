@@ -28,10 +28,10 @@ PipeWine is a high-performance ASIO (Audio Stream Input/Output) driver that enab
 - **Multiple configuration locations** (user and system-wide)
 
 ### 🔧 **Advanced Features**
-- **Dynamic sample rate switching** (44.1kHz, 48kHz, 96kHz, 192kHz)
+- **Dynamic sample rate switching** (44.1kHz, 48kHz, 96kHz, 192kHz) <- currently not working reliable
 - **Configurable buffer sizes** (16-8192 samples, powers of 2)
 - **Multiple channel configurations** (up to 64 inputs/outputs)
-- **Automatic hardware connection** with device selection
+- **Automatic hardware connection** with device selection <- currently not working
 - **Memory leak prevention** with comprehensive buffer management
 
 ### 🖥️ **Application Compatibility**

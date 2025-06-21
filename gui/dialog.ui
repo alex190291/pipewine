@@ -1,0 +1,335 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>PwAsioDialog</class>
+ <widget class="QDialog" name="PwAsioDialog">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>375</width>
+    <height>278</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>PipeWire ASIO Settings</string>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout_3">
+   <item>
+    <layout class="QVBoxLayout" name="verticalLayout">
+     <item>
+      <layout class="QFormLayout" name="formLayout">
+       <item row="0" column="0">
+        <widget class="QLabel" name="label">
+         <property name="text">
+          <string>Buffer size</string>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="1">
+        <widget class="QComboBox" name="bufferSize">
+         <property name="focusPolicy">
+          <enum>Qt::StrongFocus</enum>
+         </property>
+         <property name="inputMethodHints">
+          <set>Qt::ImhDigitsOnly</set>
+         </property>
+         <property name="editable">
+          <bool>true</bool>
+         </property>
+         <property name="currentText">
+          <string notr="true">256</string>
+         </property>
+         <property name="placeholderText">
+          <string notr="true"/>
+         </property>
+         <item>
+          <property name="text">
+           <string notr="true">256</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string notr="true">384</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string notr="true">512</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string notr="true">1024</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string notr="true">2024</string>
+          </property>
+         </item>
+        </widget>
+       </item>
+       <item row="1" column="0">
+        <widget class="QLabel" name="label_5">
+         <property name="text">
+          <string>Input channels</string>
+         </property>
+        </widget>
+       </item>
+       <item row="1" column="1">
+        <widget class="QSpinBox" name="inputChannels">
+         <property name="minimum">
+          <number>0</number>
+         </property>
+         <property name="maximum">
+          <number>64</number>
+         </property>
+         <property name="value">
+          <number>16</number>
+         </property>
+        </widget>
+       </item>
+       <item row="2" column="0">
+        <widget class="QLabel" name="label_6">
+         <property name="text">
+          <string>Output channels</string>
+         </property>
+        </widget>
+       </item>
+       <item row="2" column="1">
+        <widget class="QSpinBox" name="outputChannels">
+         <property name="minimum">
+          <number>0</number>
+         </property>
+         <property name="maximum">
+          <number>64</number>
+         </property>
+         <property name="value">
+          <number>16</number>
+         </property>
+        </widget>
+       </item>
+       <item row="3" column="0">
+        <widget class="QLabel" name="label_7">
+         <property name="text">
+          <string>Sample rate</string>
+         </property>
+        </widget>
+       </item>
+       <item row="3" column="1">
+        <widget class="QComboBox" name="sampleRate">
+         <property name="currentText">
+          <string notr="true">44100</string>
+         </property>
+         <item>
+          <property name="text">
+           <string notr="true">8000</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string notr="true">11025</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string notr="true">16000</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string notr="true">22050</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string notr="true">32000</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string notr="true">44100</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string notr="true">48000</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string notr="true">88200</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string notr="true">96000</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string notr="true">176400</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string notr="true">192000</string>
+          </property>
+         </item>
+        </widget>
+       </item>
+       <item row="4" column="0">
+        <widget class="QLabel" name="label_8">
+         <property name="text">
+          <string>Auto-connect</string>
+         </property>
+        </widget>
+       </item>
+       <item row="4" column="1">
+        <widget class="QCheckBox" name="autoConnect">
+         <property name="text">
+          <string>Automatically connect to hardware</string>
+         </property>
+         <property name="checked">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QDialogButtonBox" name="buttonBox">
+     <property name="standardButtons">
+      <set>QDialogButtonBox::Cancel|QDialogButtonBox::Ok</set>
+     </property>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+
+ <resources/>
+ <connections>
+  <connection>
+   <sender>buttonBox</sender>
+   <signal>accepted()</signal>
+   <receiver>PwAsioDialog</receiver>
+   <slot>accept()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>248</x>
+     <y>254</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>157</x>
+     <y>274</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>buttonBox</sender>
+   <signal>rejected()</signal>
+   <receiver>PwAsioDialog</receiver>
+   <slot>reject()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>316</x>
+     <y>260</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>286</x>
+     <y>274</y>
+    </hint>
+   </hints>
+  </connection>
+     <connection>
+    <sender>bufferSize</sender>
+    <signal>editTextChanged(QString)</signal>
+    <receiver>PwAsioDialog</receiver>
+    <slot>bufferSizeSet(QString)</slot>
+    <hints>
+     <hint type="sourcelabel">
+      <x>238</x>
+      <y>23</y>
+     </hint>
+     <hint type="destinationlabel">
+      <x>187</x>
+      <y>138</y>
+     </hint>
+    </hints>
+   </connection>
+
+  <connection>
+   <sender>inputChannels</sender>
+   <signal>valueChanged(int)</signal>
+   <receiver>PwAsioDialog</receiver>
+   <slot>inputChannelsChanged(int)</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>300</x>
+     <y>150</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>187</x>
+     <y>138</y>
+    </hint>
+   </hints>
+  </connection>
+     <connection>
+    <sender>outputChannels</sender>
+    <signal>valueChanged(int)</signal>
+    <receiver>PwAsioDialog</receiver>
+    <slot>outputChannelsChanged(int)</slot>
+    <hints>
+     <hint type="sourcelabel">
+      <x>300</x>
+      <y>180</y>
+     </hint>
+     <hint type="destinationlabel">
+      <x>187</x>
+      <y>138</y>
+     </hint>
+    </hints>
+   </connection>
+   <connection>
+    <sender>sampleRate</sender>
+    <signal>currentIndexChanged(QString)</signal>
+    <receiver>PwAsioDialog</receiver>
+    <slot>sampleRateChanged(QString)</slot>
+    <hints>
+     <hint type="sourcelabel">
+      <x>300</x>
+      <y>210</y>
+     </hint>
+     <hint type="destinationlabel">
+      <x>187</x>
+      <y>138</y>
+     </hint>
+    </hints>
+   </connection>
+   <connection>
+    <sender>autoConnect</sender>
+    <signal>toggled(bool)</signal>
+    <receiver>PwAsioDialog</receiver>
+    <slot>autoConnectChanged(bool)</slot>
+    <hints>
+     <hint type="sourcelabel">
+      <x>300</x>
+      <y>240</y>
+     </hint>
+     <hint type="destinationlabel">
+      <x>187</x>
+      <y>138</y>
+     </hint>
+    </hints>
+   </connection>
+ </connections>
+ <slots>
+  <slot>bufferSizeSet(QString)</slot>
+  <slot>inputChannelsChanged(int)</slot>
+  <slot>outputChannelsChanged(int)</slot>
+  <slot>sampleRateChanged(QString)</slot>
+  <slot>autoConnectChanged(bool)</slot>
+ </slots>
+</ui>

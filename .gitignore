@@ -1,0 +1,52 @@
+# Build artifacts
+build32/
+build64/
+*.dll
+*.dll.so
+*.exe
+*.o
+*.obj
+
+# IDE and editor files
+.vscode/
+.cursor/
+*.swp
+*.swo
+*~
+
+# Qt build files
+*.moc
+moc_*.cpp
+ui_*.h
+ui_*.py
+*.user
+
+# Wine-specific files
+*.reg
+*.log
+
+# Test executables
+tests/*.exe
+tests/*_test
+tests/wine_dsp_test
+tests/simple_dsp_test
+
+# User-specific files
+Preferences/
+Unlock/
+UsageData/
+.wine/
+
+# Temporary files
+*.tmp
+*.bak
+*.orig
+strace.log
+
+# Personal configuration
+info.cfg
+mimetype
+
+# OS-specific files
+.DS_Store
+Thumbs.db

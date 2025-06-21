@@ -216,6 +216,7 @@ With requirements:
 ## 🙏 Acknowledgments
 
 - **WineASIO Project** - Original ASIO implementation for Wine
+- **RtAudio Project** - Cross-platform audio I/O library and inspiration
 - **Wine Project** - Windows compatibility layer
 - **PipeWire Team** - Modern Linux audio infrastructure
 - **ASIO SDK** - Steinberg's Audio Stream I/O SDK
@@ -232,7 +233,7 @@ With requirements:
 
 If PipeWine helps your audio workflow, please consider giving it a star! ⭐
 
-[![Star History Chart](https://api.star-history.com/svg?repos=yourusername/pipewine&type=Date)](https://star-history.com/#yourusername/pipewine&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=alex190291/pipewine&type=Date)](https://star-history.com/#alex190291/pipewine&Date)
 
 ---
 

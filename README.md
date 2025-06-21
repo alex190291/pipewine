@@ -49,7 +49,7 @@ PipeWine is a high-performance ASIO (Audio Stream Input/Output) driver that enab
 ### Installation
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/pipewine.git
+git clone https://github.com/alex190291/pipewine.git
 cd pipewine
 
 # Build the driver
@@ -184,7 +184,7 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
 
 ### Development Setup
 ```bash
-git clone https://github.com/yourusername/pipewine.git
+git clone https://github.com/alex190291/pipewine.git
 cd pipewine
 make 64
 ./tests/run_tests.sh

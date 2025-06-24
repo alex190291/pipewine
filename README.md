@@ -97,6 +97,8 @@ rt_priority = 10
 # Set PipeWire quantum to match buffer size
 pw-metadata -n settings 0 clock.quantum 512
 ```
+## ✨ Known Issues:
+You need to disable your DAWs audio engine otherwise programs started after the DAW cant create Pipewire portals
 
 ## 🎵 Audio Applications
 

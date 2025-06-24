@@ -1129,10 +1129,31 @@ HIDDEN ASIOBool STDMETHODCALLTYPE Init(LPWINEASIO iface, void *sysRef)
 
     user_pw_lock_loop(This->pw_helper);
 
+    /*
+     * Use a direction-specific media class so that the session-manager
+     * (WirePlumber / pipewire-media-session) can figure out where the
+     * stream needs to be linked automatically.  With the generic
+     * "Stream/Audio" value the policy engine does not know whether this
+     * stream is meant for playback or capture and therefore keeps it
+     * unlinked.
+     *
+     * We also switch the role from the rather esoteric "Production" to
+     * the more common "Music" role.  Some policy scripts (notably the
+     * flatpak portal helpers) treat the "Production" role as a special
+     * pro-audio role and will refuse to create new streams while such a
+     * client is active – this is what caused other applications to fail
+     * when PipeWine was running.  Using the standard role removes that
+     * restriction whilst still allowing users to override it manually if
+     * they need exclusive, low-latency routing.
+     */
+
+    const char *media_class = (This->wineasio_number_outputs > 0) ?
+                              "Stream/Output/Audio" : "Stream/Input/Audio";
+
     This->pw_filter = pw_filter_new(This->pw_core, This->client_name, pw_properties_new(
         PW_KEY_MEDIA_TYPE, "Audio",
-        PW_KEY_MEDIA_ROLE, "Production",
-        PW_KEY_MEDIA_CLASS, "Stream/Audio",
+        PW_KEY_MEDIA_ROLE, "Music",
+        PW_KEY_MEDIA_CLASS, media_class,
         PW_KEY_NODE_AUTOCONNECT, "true",
         NULL
     ));

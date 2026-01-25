@@ -22,6 +22,7 @@ void destroy_helper(Helper *helper);
 // Node enumeration and selection
 std::vector<struct pw_node *> enumerate_pipewire_endpoints(Helper *helper);
 struct pw_node *get_default_node(Helper *helper, enum spa_direction direction);
+struct pw_node *get_default_node_nonblocking(Helper *helper, enum spa_direction direction);
 struct pw_node *find_node_by_name(Helper *helper, char const *name);
 
 // Enhanced node property access

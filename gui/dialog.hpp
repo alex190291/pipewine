@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QtWidgets/QDialog>
+#include <QtWidgets/QLabel>
 #include <QtCore/QObject>
 
 #include "ui_dialog.hpp"
@@ -65,4 +66,20 @@ class PwAsioDialog: public QDialog {
 
 	// Use C API helper instead of C++ API
 	struct user_pw_helper *pw_helper;
+
+	// Validation label for error messages
+	QLabel *validationLabel;
+	// Latency display label
+	QLabel *latencyLabel;
+
+	// Validation helper methods
+	void showValidationError(const QString &message);
+	void clearValidationError();
+	bool isValidBufferSize(uint32_t size);
+	bool isValidSampleRate(uint32_t rate);
+
+	// UI update helpers
+	void updateLatencyDisplay();
+	void populateBufferSizePresets();
+	void populateSampleRatePresets();
 };

@@ -201,16 +201,38 @@ According to previous testing and memory records:
 - Used compiler hints for predictable branch behavior
 - Minimized memory allocations and deallocations
 
-## 7. Testing and Validation
+## 7. Current Performance Characteristics
 
-### 7.1 Performance Metrics
+### Latency
+- Minimum achievable: ~5.3ms @ 48kHz with 256 sample buffer
+- Recommended for stability: 1024 samples (~21ms @ 48kHz)
+
+### Known Performance Issues
+
+1. **Callback Marshalling Overhead**
+   - ASIO callbacks are marshalled from PipeWire thread to Wine thread
+   - This adds ~0.1-1ms of latency depending on system load
+
+2. **Polling Loops**
+   - Filter state transitions use polling (being addressed)
+   - Recommendation: Use longer buffer sizes if experiencing glitches
+
+### Optimization Opportunities
+
+1. Lock-free callback queue (not implemented)
+2. Direct buffer sharing (requires Wine kernel changes)
+3. SIMD-optimized buffer copying (partially implemented)
+
+## 8. Testing and Validation
+
+### 8.1 Performance Metrics
 
 The optimizations can be validated using:
 - **VBAsioTest64**: Measures callback timing and buffer performance
 - **Ableton Live**: Real-world DAW testing for professional audio workloads
 - **Buffer validation tests**: Ensure clean audio without dropouts or distortion
 
-### 7.2 Expected Results
+### 8.2 Expected Results
 
 With these optimizations, the driver should achieve:
 - **Sub-6ms latency** at 48kHz with 256-sample buffers
@@ -218,23 +240,23 @@ With these optimizations, the driver should achieve:
 - **Consistent callback timing** without jitter
 - **Professional-grade performance** suitable for live audio production
 
-## 8. Future Optimization Opportunities
+## 9. Future Optimization Opportunities
 
-### 8.1 SIMD Optimizations
+### 9.1 SIMD Optimizations
 
 Potential for further optimization using SIMD instructions:
 - Vectorized audio buffer copying for multi-channel audio
 - SIMD-optimized format conversions if needed
 - Parallel processing of multiple audio channels
 
-### 8.2 Lock-Free Data Structures
+### 9.2 Lock-Free Data Structures
 
 Consider implementing lock-free ring buffers for:
 - Eliminating critical sections in real-time path
 - Reducing synchronization overhead
 - Improving multi-core scalability
 
-### 8.3 Memory Pool Allocation
+### 9.3 Memory Pool Allocation
 
 Implement custom memory pools for:
 - Eliminating heap allocation overhead

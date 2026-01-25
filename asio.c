@@ -27,6 +27,7 @@
  */
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <errno.h>
 #include <limits.h>
 #include <unistd.h>
@@ -40,7 +41,9 @@
 #include <spa/param/audio/format-utils.h>
 #include <spa/param/buffers.h>
 #include <spa/param/latency-utils.h>
+#include <spa/control/control.h>
 #include <spa/pod/builder.h>
+#include <spa/pod/iter.h>
 #include <spa/buffer/buffer.h>
 #include <pipewire/buffers.h>
 #include <pipewire/context.h>
@@ -50,6 +53,8 @@
 #include "gui/gui_stub.inc.c"
 #include "pw_helper_c.h"
 #include "pw_helper_common.h"
+#include "pw_midi.h"
+#include "pw_asio_midi.h"
 #include "driver_clsid.h"
 
 /* Performance optimization macros */
@@ -62,8 +67,8 @@
 #include <wine/debug.h>
 #else
 #define TRACE(...) {}
-#define WARN(fmt, ...) {} fprintf(stdout, fmt, ##__VA_ARGS__)
-#define ERR(fmt, ...) {} fprintf(stderr, fmt, ##__VA_ARGS__)
+#define WARN(fmt, ...) fprintf(stdout, "WARN: " fmt, ##__VA_ARGS__)
+#define ERR(fmt, ...) fprintf(stderr, "ERR: " fmt, ##__VA_ARGS__)
 #endif
 
 #include <objbase.h>
@@ -86,6 +91,11 @@ WINE_DEFAULT_DEBUG_CHANNEL(asio);
 #define ASIO_MINIMUM_BUFFERSIZE     16
 #define ASIO_MAXIMUM_BUFFERSIZE     8192
 #define ASIO_PREFERRED_BUFFERSIZE   1024
+#define PW_ASIO_MAX_CHANNELS        64
+#define PW_ASIO_DEFAULT_MIDI_INPUTS 1
+#define PW_ASIO_DEFAULT_MIDI_OUTPUTS 1
+#define PW_ASIO_MAX_MIDI_PORTS      1
+#define PW_ASIO_MIDI_BUFFER_BYTES   (MAX_MIDI_EVENTS_PER_BUFFER * 32u)
 
 #define ASIO_LONG(typ, x) ({ uint64_t __long_val = (x); (typ) { .lo = (uint32_t)__long_val, .hi = (uint32_t)(__long_val >> 32) }; })
 
@@ -175,6 +185,13 @@ typedef struct IOChannel
     bool                         needs_copy;       /* Whether data copying is needed */
 } IOChannel;
 
+typedef struct MidiPort
+{
+    bool                         active;
+    char                         port_name[ASIO_MAX_NAME_LENGTH];
+    void                        *port;
+} MidiPort;
+
 #define DEVICE_NAME_SIZE 1024
 
 typedef struct IWineASIOImpl
@@ -205,11 +222,12 @@ typedef struct IWineASIOImpl
     bool                        asio_time_info_mode;
 
     /* WineASIO configuration options */
-    bool                        wineasio_autostart_server;
     bool                        wineasio_connect_to_hardware;
     bool                        wineasio_fixed_buffersize;
     int                         wineasio_number_inputs;
     int                         wineasio_number_outputs;
+    int                         wineasio_number_midi_inputs;
+    int                         wineasio_number_midi_outputs;
     LONG                        wineasio_preferred_buffersize;
     WCHAR                       pwasio_input_device_name[DEVICE_NAME_SIZE];
     WCHAR                       pwasio_output_device_name[DEVICE_NAME_SIZE];
@@ -223,6 +241,9 @@ typedef struct IWineASIOImpl
     struct pw_node *current_input_node;
     struct pw_node *current_output_node;
 
+    HANDLE                     node_resolve_thread;
+    LONG                       node_resolve_stop;
+
     struct pw_filter *pw_filter;
     struct spa_hook pw_filter_listener;
 
@@ -231,10 +252,17 @@ typedef struct IWineASIOImpl
 
     char                        client_name[ASIO_MAX_NAME_LENGTH];
 
-    /* jack process callback buffers */
-    //jack_default_audio_sample_t *callback_audio_buffer;
+    /* Audio channel buffers */
     IOChannel                   *input_channel;
     IOChannel                   *output_channel;
+
+    /* MIDI ports and buffers */
+    MidiPort                    *midi_input_ports;
+    MidiPort                    *midi_output_ports;
+    struct midi_buffer          midi_in_buffer;
+    struct midi_buffer          midi_out_buffer;
+    bool                        midi_buffers_initialized;
+    uint32_t                    midi_buffer_bytes;
 
     uint32_t                     asio_buffers_left_to_init;
     pthread_barrier_t            asio_buffers_filled;
@@ -302,22 +330,17 @@ HIDDEN void __thiscall_Future(void);
 HIDDEN void __thiscall_OutputReady(void);
 
 /*
- *  Jack callbacks
+ *  PipeWire callbacks
  */
-
-static inline int  jack_buffer_size_callback (jack_nframes_t nframes, void *arg);
-static inline void jack_latency_callback(jack_latency_callback_mode_t mode, void *arg);
-static inline int  jack_process_callback (jack_nframes_t nframes, void *arg);
-static inline int  jack_sample_rate_callback (jack_nframes_t nframes, void *arg);
 
 /*
  *  Support functions
  */
 
 HRESULT WINAPI  WineASIOCreateInstance(REFIID riid, LPVOID *ppobj, IUnknown *cls_factory);
-static  void    store_config(IWineASIOImpl *This);
-static  VOID    configure_driver(IWineASIOImpl *This);
+static  void    configure_driver(IWineASIOImpl *This);
 static  void    get_nodes_by_name(IWineASIOImpl *This);
+static  void    Uninit(IWineASIOImpl *This);
 
 HIDDEN void GuiClosed(struct pwasio_gui_conf *conf);
 HIDDEN void GuiApplyConfig(struct pwasio_gui_conf *conf);
@@ -325,6 +348,8 @@ HIDDEN void GuiLoadConfig(struct pwasio_gui_conf *conf);
 
 static DWORD WINAPI jack_thread_creator_helper(LPVOID arg);
 static int          jack_thread_creator(pthread_t* thread_id, const pthread_attr_t* attr, void *(*function)(void*), void* arg);
+static DWORD WINAPI node_resolve_thread_proc(LPVOID arg);
+static void         ensure_nodes_ready_async(IWineASIOImpl *This);
 
 static const IWineASIOVtbl WineASIO_Vtbl =
 {
@@ -355,7 +380,7 @@ static const IWineASIOVtbl WineASIO_Vtbl =
     (void *) THISCALL(OutputReady)
 };
 
-/* structure needed to create the JACK callback thread in the wine process context */
+/* structure needed to create the PipeWire callback thread in the wine process context */
 struct {
     void        *(*jack_callback_thread) (void*);
     void        *arg;
@@ -385,58 +410,127 @@ typedef struct {
 
 static ASIOCallbackManager g_callback_manager = {0};
 
+static char g_last_error[256] = "No error";
+
+static DWORD WINAPI node_resolve_thread_proc(LPVOID arg) {
+    IWineASIOImpl *This = (IWineASIOImpl *)arg;
+    int backoff_ms = 10;
+
+    while (!InterlockedCompareExchange(&This->node_resolve_stop, 0, 0)) {
+        get_nodes_by_name(This);
+
+        if (This->current_input_node && This->current_output_node) {
+            TRACE("Async node resolve completed\n");
+            break;
+        }
+
+        user_pw_trigger_event_processing(This->pw_helper);
+        Sleep(backoff_ms);
+        if (backoff_ms < 200) {
+            backoff_ms *= 2;
+        }
+    }
+
+    return 0;
+}
+
+static void ensure_nodes_ready_async(IWineASIOImpl *This) {
+    HANDLE thread = This->node_resolve_thread;
+    DWORD exit_code = 0;
+
+    if (thread) {
+        if (GetExitCodeThread(thread, &exit_code) && exit_code == STILL_ACTIVE) {
+            return;
+        }
+        CloseHandle(thread);
+        This->node_resolve_thread = NULL;
+    }
+
+    This->node_resolve_stop = 0;
+    This->node_resolve_thread = CreateThread(NULL, 0, node_resolve_thread_proc, This, 0, NULL);
+    if (!This->node_resolve_thread) {
+        WARN("Failed to start node resolve thread\n");
+    }
+}
+
+static void set_last_error(const char *fmt, ...) {
+    va_list args;
+
+    va_start(args, fmt);
+    vsnprintf(g_last_error, sizeof(g_last_error), fmt, args);
+    va_end(args);
+}
+
 /* Wine thread function for ASIO callbacks */
 static DWORD WINAPI asio_callback_thread_proc(LPVOID param) {
     ASIOCallbackManager *manager = (ASIOCallbackManager*)param;
     ASIOCallbackData *data = &manager->callback_data;
-    
+
     TRACE("ASIO callback thread started\n");
-    printf("ASIO callback thread started in Wine context\n");
-    
+
     while (!data->thread_should_exit) {
-        /* Wait for callback request from PipeWire thread */
+        /* Simple wait for callback request from PipeWire thread
+         * Following WineASIO's approach: NO message processing in callback thread
+         * Wine's main thread handles all Windows messages including MIDI input
+         */
         DWORD wait_result = WaitForSingleObject(data->callback_event, 1000); /* 1 second timeout */
-        
+
         if (wait_result == WAIT_TIMEOUT) {
             continue; /* Check exit condition */
         }
-        
+
         if (wait_result != WAIT_OBJECT_0 || data->thread_should_exit) {
             break;
         }
         
         /* Process the callback in Wine's thread context */
         EnterCriticalSection(&manager->callback_lock);
-        
+
         if (data->callback_pending && data->This && data->This->asio_callbacks) {
             IWineASIOImpl *This = data->This;
-            
+
             TRACE("Executing ASIO callback in Wine thread context\n");
-            /* Verbose debug disabled for cleaner output */
-            /* printf("Executing ASIO callback: buffer_index=%d, time_info=%d\n", 
-                   data->buffer_index, data->use_time_info); */
-            
+
+            /* Measure callback execution time for debugging slow callbacks */
+            LARGE_INTEGER start_time, end_time, frequency;
+            QueryPerformanceFrequency(&frequency);
+            QueryPerformanceCounter(&start_time);
+
             /* Call the ASIO callback in Wine's thread context */
             if (data->use_time_info && This->asio_time_info_mode) {
                 This->asio_callbacks->bufferSwitchTimeInfo(&data->asio_time, data->buffer_index, data->direct_process);
             } else {
                 This->asio_callbacks->bufferSwitch(data->buffer_index, data->direct_process);
             }
-            
-            /* Verbose debug disabled for cleaner output */
-            /* printf("ASIO callback completed successfully\n"); */
+
+            QueryPerformanceCounter(&end_time);
+            double callback_ms = ((end_time.QuadPart - start_time.QuadPart) * 1000.0) / frequency.QuadPart;
+
+            /* Warn if callback takes longer than quantum duration (indicates host app is slow) */
+            static int slow_callback_count = 0;
+            double quantum_ms = (This->asio_current_buffersize * 1000.0) / This->asio_sample_rate;
+            if (callback_ms > quantum_ms && slow_callback_count < 3) {
+                printf("WARNING: ASIO callback took %.2f ms (quantum=%.2f ms) - host app processing is slow!\n",
+                       callback_ms, quantum_ms);
+                printf("  This may cause audio glitches. Consider increasing buffer size.\n");
+                slow_callback_count++;
+            }
+
             data->callback_pending = false;
         }
-        
+
         LeaveCriticalSection(&manager->callback_lock);
-        
+
         /* Signal completion to PipeWire thread */
         SetEvent(data->callback_completed);
+
+        /* No sleep or yield needed - following WineASIO's simple approach
+         * Wine's main thread handles all MIDI input
+         * Normal thread priority prevents starvation of Wine's MIDI processing
+         */
     }
     
     TRACE("ASIO callback thread exiting\n");
-    /* Keep this one for thread lifecycle debugging */
-    printf("ASIO callback thread exiting\n");
     return 0;
 }
 
@@ -447,8 +541,6 @@ static BOOL init_asio_callback_manager(IWineASIOImpl *This) {
     }
     
     TRACE("Initializing ASIO callback manager\n");
-    /* Keep this one as it's important for initialization confirmation */
-    printf("Initializing ASIO callback manager for Wine thread marshalling\n");
     
     InitializeCriticalSection(&g_callback_manager.callback_lock);
     
@@ -464,6 +556,7 @@ static BOOL init_asio_callback_manager(IWineASIOImpl *This) {
     if (!g_callback_manager.callback_data.callback_event || 
         !g_callback_manager.callback_data.callback_completed) {
         ERR("Failed to create callback synchronization events\n");
+        set_last_error("Failed to create callback synchronization events");
         return FALSE;
     }
     
@@ -480,10 +573,23 @@ static BOOL init_asio_callback_manager(IWineASIOImpl *This) {
         return FALSE;
     }
     
-    /* Set thread priority for low-latency audio */
-    SetThreadPriority(g_callback_manager.callback_thread, THREAD_PRIORITY_TIME_CRITICAL);
-    
-    /* Set thread affinity to avoid CPU migration for better cache performance */
+    /* Set thread priority for low-latency audio
+     * Critical finding: MIDI stops working when thread priority is too high
+     * Testing showed:
+     *   - TIME_CRITICAL: MIDI stops after 1-2 minutes
+     *   - HIGHEST: MIDI stops after 1-2 minutes
+     *   - ABOVE_NORMAL: Still causes MIDI issues
+     * Following WineASIO's simpler approach: DON'T elevate priority at all
+     * Let Windows scheduler handle it - this prevents Wine's MIDI thread from being starved
+     * If you get audio glitches, increase buffer size instead of thread priority
+     */
+    SetThreadPriority(g_callback_manager.callback_thread, THREAD_PRIORITY_NORMAL);
+
+    /* CPU affinity pinning disabled - it can cause thread starvation issues
+     * The OS scheduler does a good job of keeping threads on the same core anyway.
+     * If cache performance becomes an issue, this can be re-enabled via config.
+     */
+    #if 0
     {
         DWORD_PTR process_affinity, system_affinity;
         if (GetProcessAffinityMask(GetCurrentProcess(), &process_affinity, &system_affinity)) {
@@ -492,6 +598,7 @@ static BOOL init_asio_callback_manager(IWineASIOImpl *This) {
             SetThreadAffinityMask(g_callback_manager.callback_thread, thread_affinity);
         }
     }
+    #endif
     
     TRACE("ASIO callback manager initialized successfully\n");
     /* Verbose debug disabled for cleaner output */
@@ -506,7 +613,6 @@ static void cleanup_asio_callback_manager(void) {
     }
     
     TRACE("Cleaning up ASIO callback manager\n");
-    printf("Cleaning up ASIO callback manager\n");
     
     /* Signal thread to exit */
     EnterCriticalSection(&g_callback_manager.callback_lock);
@@ -536,6 +642,7 @@ static void marshal_asio_callback(IWineASIOImpl *This, LONG buffer_index, ASIOBo
                                   ASIOTime *asio_time, bool use_time_info) {
     if (!g_callback_manager.callback_thread) {
         ERR("ASIO callback manager not initialized\n");
+        set_last_error("ASIO callback manager not initialized");
         return;
     }
     
@@ -545,6 +652,7 @@ static void marshal_asio_callback(IWineASIOImpl *This, LONG buffer_index, ASIOBo
     if (g_callback_manager.callback_data.callback_pending) {
         /* Previous callback still pending - this shouldn't happen in normal operation */
         WARN("Previous ASIO callback still pending, skipping\n");
+        set_last_error("Previous ASIO callback still pending");
         LeaveCriticalSection(&g_callback_manager.callback_lock);
         return;
     }
@@ -564,73 +672,78 @@ static void marshal_asio_callback(IWineASIOImpl *This, LONG buffer_index, ASIOBo
     
     /* Signal the Wine thread to process the callback */
     SetEvent(g_callback_manager.callback_data.callback_event);
-    
-    /* Wait for callback completion with timeout to prevent deadlocks */
-    DWORD wait_result = WaitForSingleObject(g_callback_manager.callback_data.callback_completed, 100); /* 100ms timeout */
-    
+
+    /* Wait for callback completion with dynamic timeout
+     * Timeout = 3x the quantum duration to allow for processing overhead
+     * but not so long that we starve other threads (especially MIDI input)
+     * Old 100ms timeout was causing MIDI to stop working after 1-2 minutes!
+     */
+    DWORD quantum_ms = (DWORD)((This->asio_current_buffersize * 1000.0) / This->asio_sample_rate);
+    DWORD timeout_ms = quantum_ms * 3; /* 3x quantum duration */
+    if (timeout_ms < 5) timeout_ms = 5;   /* Minimum 5ms */
+    if (timeout_ms > 50) timeout_ms = 50; /* Maximum 50ms to prevent starvation */
+
+    DWORD wait_result = WaitForSingleObject(g_callback_manager.callback_data.callback_completed, timeout_ms);
+
     if (wait_result == WAIT_TIMEOUT) {
-        WARN("ASIO callback timed out after 100ms\n");
-        printf("ASIO callback timed out - this may indicate a threading issue\n");
-    } else if (wait_result == WAIT_OBJECT_0) {
-        /* Callback completed successfully */
-        /* Verbose debug disabled for cleaner output - only show first few for verification */
-        static int success_count = 0;
-        if (success_count < 3) {  /* Reduced from 10 to 3 for minimal output */
-            printf("ASIO callback marshalling successful #%d\n", ++success_count);
-        } else if (success_count == 3) {
-            printf("ASIO callback marshalling working - further success messages suppressed\n");
-            success_count++;
+        static int timeout_count = 0;
+        if (timeout_count < 5) {
+            WARN("ASIO callback timed out after %lu ms (quantum=%lu ms)\n", timeout_ms, quantum_ms);
+            timeout_count++;
         }
+        set_last_error("ASIO callback timed out");
     }
 }
 
 static void pipewire_state_changed_callback(void *data, enum pw_filter_state from, enum pw_filter_state to, char const *error) {
     IWineASIOImpl *This = (IWineASIOImpl*)data;
 
-    printf("state_chaanged: iface:%p state changed from %s to %s", This, pw_filter_state_as_string(from), pw_filter_state_as_string(to));
     if (error) {
-        printf(": ERROR %s\n", error);
+        WARN("state_changed: iface:%p state changed from %s to %s: %s\n", This,
+             pw_filter_state_as_string(from), pw_filter_state_as_string(to), error);
     } else {
-        putchar('\n');
+        TRACE("state_changed: iface:%p state changed from %s to %s\n", This,
+              pw_filter_state_as_string(from), pw_filter_state_as_string(to));
     }
 }
 
 static void pipewire_io_changed_callback(void *data, void *port, uint32_t id, void *area, uint32_t size) {
     IWineASIOImpl *This = (IWineASIOImpl*)data;
-
-    printf("io_changed: iface:%p IO changed on port %p: 0x%04x\n", This, port, id);
+    (void)This; /* Used in TRACE */
+    TRACE("io_changed: iface:%p IO changed on port %p: 0x%04x\n", This, port, id);
 }
 
 static void pipewire_param_changed_callback(void *data, void *port, uint32_t id, struct spa_pod const *param) {
     IWineASIOImpl *This = (IWineASIOImpl*)data;
-
-    printf("param_changed: iface:%p param 0x%04x changed on port %p\n", This, id, port);
+    (void)This; /* Used in TRACE */
+    TRACE("param_changed: iface:%p param 0x%04x changed on port %p\n", This, id, port);
 }
 
 static void pipewire_add_buffer_callback(void *data, void *port, struct pw_buffer *buffer) {
     IWineASIOImpl *This = (IWineASIOImpl*)data;
 
-    printf("add_buffer: iface:%p port:%p, buffer:%p\n", This, port, buffer);
+    TRACE("add_buffer: iface:%p port:%p, buffer:%p\n", This, port, buffer);
 
     for (int idx = 0; idx < This->wineasio_number_inputs + This->wineasio_number_outputs; ++idx) {
         IOChannel *chan = &This->input_channel[idx];
         if (chan->port == port) {
             if (chan->buffers[1]) {
                 if (chan->buffers[0]) {
-                    printf("Buffers for channel %s already full!\n", chan->port_name);
+                    WARN("Buffers for channel %s already full\n", chan->port_name);
+                    set_last_error("Buffers for channel %s already full", chan->port_name);
                     return;
                 } else {
-                    printf("Adding second buffer for channel %s\n", chan->port_name);
+                    TRACE("Adding second buffer for channel %s\n", chan->port_name);
                     chan->buffers[0] = buffer;
 
                     buffer = pw_filter_dequeue_buffer(chan->port);
                     buffer->buffer->datas[0].chunk->offset = 0;
                     buffer->buffer->datas[0].chunk->stride = sizeof(float);
                     buffer->buffer->datas[0].chunk->size = 0;
-                    printf("Dequeued buffer: %p\n", buffer);
+                    TRACE("Dequeued buffer: %p\n", buffer);
                 }
             } else {
-                printf("Adding first buffer for channel %s\n", chan->port_name);
+                TRACE("Adding first buffer for channel %s\n", chan->port_name);
                 chan->buffers[1] = buffer;
             }
 
@@ -646,8 +759,106 @@ static void pipewire_add_buffer_callback(void *data, void *port, struct pw_buffe
 
 static void pipewire_remove_buffer_callback(void *data, void *port, struct pw_buffer *buffer) {
     IWineASIOImpl *This = (IWineASIOImpl*)data;
+    (void)This; /* Used in TRACE */
+    TRACE("remove_buffer: iface:%p port:%p, buffer:%p\n", This, port, buffer);
+}
 
-    printf("remove_buffer: iface:%p port:%p, buffer:%p\n", This, port, buffer);
+static void process_midi_input(IWineASIOImpl *This, uint32_t frame_count) {
+    if (!This || !This->midi_input_ports || This->wineasio_number_midi_inputs <= 0) {
+        return;
+    }
+
+    for (int idx = 0; idx < This->wineasio_number_midi_inputs; ++idx) {
+        MidiPort *port = &This->midi_input_ports[idx];
+        if (!port->active || !port->port) {
+            continue;
+        }
+
+        void *buffer = pw_filter_get_dsp_buffer(port->port, frame_count);
+        if (!buffer) {
+            continue;
+        }
+
+        struct spa_pod *pod = (struct spa_pod *)buffer;
+        if (!spa_pod_is_sequence(pod)) {
+            continue;
+        }
+
+        struct spa_pod_sequence *seq = (struct spa_pod_sequence *)pod;
+        struct spa_pod_control *ctrl = NULL;
+        SPA_POD_SEQUENCE_FOREACH(seq, ctrl) {
+            if (ctrl->type != SPA_CONTROL_Midi) {
+                continue;
+            }
+
+            struct spa_pod *value = &ctrl->value;
+            if (value->type != SPA_TYPE_Bytes) {
+                continue;
+            }
+
+            const uint8_t *data = (const uint8_t *)SPA_POD_BODY(value);
+            uint32_t size = SPA_POD_BODY_SIZE(value);
+            uint32_t offset = ctrl->offset;
+
+            if (frame_count > 0 && offset >= frame_count) {
+                offset = frame_count - 1;
+            }
+
+            if (!midi_buffer_try_write(&This->midi_in_buffer, 0, offset, data, (uint8_t)size)) {
+                static int drop_count = 0;
+                if (drop_count < 3) {
+                    WARN("MIDI input buffer full or locked, dropping event\n");
+                }
+                drop_count++;
+            }
+        }
+    }
+}
+
+static void process_midi_output(IWineASIOImpl *This, uint32_t frame_count) {
+    if (!This || !This->midi_output_ports || This->wineasio_number_midi_outputs <= 0) {
+        return;
+    }
+
+    for (int idx = 0; idx < This->wineasio_number_midi_outputs; ++idx) {
+        MidiPort *port = &This->midi_output_ports[idx];
+        if (!port->active || !port->port) {
+            continue;
+        }
+
+        void *buffer = pw_filter_get_dsp_buffer(port->port, frame_count);
+        if (!buffer) {
+            continue;
+        }
+
+        struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, This->midi_buffer_bytes);
+        struct spa_pod_frame frame;
+        spa_pod_builder_push_sequence(&builder, &frame, 0);
+
+        struct midi_event ev;
+        while (midi_buffer_try_read(&This->midi_out_buffer, &ev)) {
+            if (ev.port != 0) {
+                continue;
+            }
+
+            uint32_t offset = ev.offset;
+            if (frame_count > 0 && offset >= frame_count) {
+                offset = frame_count - 1;
+            }
+
+            if (spa_pod_builder_control(&builder, offset, SPA_CONTROL_Midi) < 0 ||
+                spa_pod_builder_bytes(&builder, ev.data, ev.size) < 0) {
+                static int build_fail_count = 0;
+                if (build_fail_count < 3) {
+                    WARN("MIDI output buffer overflow, dropping event\n");
+                }
+                build_fail_count++;
+                break;
+            }
+        }
+
+        spa_pod_builder_pop(&builder, &frame);
+    }
 }
 
 static void pipewire_process_callback(void *data, struct spa_io_position *position) {
@@ -656,7 +867,21 @@ static void pipewire_process_callback(void *data, struct spa_io_position *positi
     size_t         pw_sample_count = position->clock.duration;
     size_t         asio_sample_count = This->asio_current_buffersize;
     size_t         process_samples = asio_sample_count; /* Always use fixed ASIO buffer size */
-    
+    uint64_t       current_sample_position;
+    uint64_t       current_time_stamp;
+
+    /* DEBUG: Check for quantum mismatch */
+    static int mismatch_count = 0;
+    if (pw_sample_count != asio_sample_count && mismatch_count < 5) {
+        printf("BUFFER SIZE MISMATCH: PipeWire quantum=%zu ASIO buffer=%zu (processing %zu samples)\n",
+               pw_sample_count, asio_sample_count,
+               (pw_sample_count < asio_sample_count) ? pw_sample_count : asio_sample_count);
+        mismatch_count++;
+        if (mismatch_count == 5) {
+            printf("  -> This mismatch causes slowed/pitched audio! PipeWire quantum must match ASIO buffer size.\n");
+        }
+    }
+
     /* Fast validation - minimize branches in real-time path */
     if (unlikely(!This || This->asio_driver_state != Running || !This->asio_callbacks)) {
         /* Output silence if not ready - optimized for minimal CPU usage */
@@ -714,31 +939,43 @@ static void pipewire_process_callback(void *data, struct spa_io_position *positi
         }
     }
 
-    /* Update timing information - optimized for minimal overhead */
-    This->asio_sample_position += asio_sample_count;
-    
-    /* Optimized timestamp calculation */
+    /* Capture MIDI input events before invoking the ASIO callback */
+    process_midi_input(This, (uint32_t)process_samples);
+
+    /* Capture current timing before calling the ASIO callback */
+    current_sample_position = This->asio_sample_position;
+
     if (likely(!(position->clock.flags & SPA_IO_CLOCK_FLAG_FREEWHEEL))) {
-        /* Use PipeWire's clock time - fastest path */
-        This->asio_time_stamp = position->clock.nsec / 1000ULL;
+        /* Use PipeWire's clock time (nanoseconds) */
+        current_time_stamp = position->clock.nsec;
     } else {
-        /* Freewheel mode - calculate from sample position */
-        This->asio_time_stamp = (uint64_t)((double)This->asio_sample_position * 1000000.0 / This->asio_sample_rate);
+        /* Freewheel mode - calculate from sample position (nanoseconds) */
+        current_time_stamp = (uint64_t)((double)current_sample_position * 1000000000.0 / This->asio_sample_rate);
     }
+
+    /* Expose current timing for ASIO time info and GetSamplePosition */
+    This->asio_time_stamp = current_time_stamp;
 
     /* Marshal ASIO callback - capture buffer index before it changes */
     current_buffer_index = This->asio_buffer_index;
-    
+
     /* Optimized callback marshalling */
     if (likely(This->asio_time_info_mode)) {
         /* Pre-fill time structure for efficiency */
-        This->asio_time.timeInfo.samplePosition = ASIO_LONG(ASIOSamples, This->asio_sample_position);
-        This->asio_time.timeInfo.systemTime = ASIO_LONG(ASIOTimeStamp, This->asio_time_stamp);
+        This->asio_time.timeInfo.samplePosition = ASIO_LONG(ASIOSamples, current_sample_position);
+        This->asio_time.timeInfo.systemTime = ASIO_LONG(ASIOTimeStamp, current_time_stamp);
         This->asio_time.timeInfo.sampleRate = This->asio_sample_rate;
         This->asio_time.timeInfo.flags = kSystemTimeValid | kSamplePositionValid | kSampleRateValid;
         marshal_asio_callback(This, current_buffer_index, ASIOTrue, &This->asio_time, true);
     } else {
         marshal_asio_callback(This, current_buffer_index, ASIOTrue, NULL, false);
+    }
+
+    /* Advance timing after the callback */
+    This->asio_sample_position = current_sample_position + asio_sample_count;
+    if (This->asio_sample_rate > 0) {
+        uint64_t buffer_duration_ns = (asio_sample_count * 1000000000ULL) / (uint64_t)This->asio_sample_rate;
+        This->asio_time_stamp = current_time_stamp + buffer_duration_ns;
     }
 
     /* Optimized output processing - minimize memory operations */
@@ -768,6 +1005,9 @@ static void pipewire_process_callback(void *data, struct spa_io_position *positi
         }
     }
 
+    /* Flush MIDI output events after the ASIO callback */
+    process_midi_output(This, (uint32_t)process_samples);
+
     /* Atomic buffer index switch for thread safety */
     This->asio_buffer_index ^= 1;
 }
@@ -778,19 +1018,10 @@ static int pipewire_worker_callback(void *userdata, enum pw_op_type operation) {
     int result = 0;
     
     TRACE("Worker callback: operation=%d, driver=%p\n", operation, This);
-    /* Verbose debug disabled for cleaner output */
-    /* printf("Worker callback: operation=%d, driver=%p\n", operation, This); */
     
     switch (operation) {
         case PW_OP_CONNECT_FILTER: {
             /* This executes in the correct PipeWire thread context */
-            
-            /* Set PipeWire quantum using the PipeWire API instead of system calls */
-            printf("Worker: Setting PipeWire quantum to %d samples via API\n", This->asio_current_buffersize);
-            
-            /* PipeWire quantum should be set by GUI - driver just connects */
-            printf("Worker: Connecting filter (quantum should be pre-configured by GUI)\n");
-            
             char pod_buffer[0x1000];
             struct spa_pod_builder pod_builder = SPA_POD_BUILDER_INIT(pod_buffer, sizeof pod_buffer);
             struct spa_audio_info_raw format = SPA_AUDIO_INFO_RAW_INIT(
@@ -807,35 +1038,44 @@ static int pipewire_worker_callback(void *userdata, enum pw_op_type operation) {
                 spa_process_latency_build(&pod_builder, SPA_PARAM_ProcessLatency,
                     &SPA_PROCESS_LATENCY_INFO_INIT(.ns = latency_ns)),
             };
-            
+
+            /* Set quantum to match ASIO buffer size */
+            char rate_str[32], latency_str[32];
+            uint32_t quantum = This->asio_current_buffersize;
+            uint32_t rate = (uint32_t)This->asio_sample_rate;
+            snprintf(rate_str, sizeof(rate_str), "%u/%u", quantum, rate);
+            snprintf(latency_str, sizeof(latency_str), "%u/%u", quantum, rate);
+
+            const struct spa_dict_item items[] = {
+                { PW_KEY_NODE_RATE, rate_str },
+                { PW_KEY_NODE_LATENCY, latency_str },
+            };
+            const struct spa_dict dict = SPA_DICT_INIT(items, 2);
+            pw_filter_update_properties(This->pw_filter, NULL, &dict);
+
             TRACE("Worker: Connecting PipeWire filter in correct thread context\n");
-            printf("Worker: Connecting PipeWire filter with %d samples (%.2f ms) at %.0f Hz\n", 
-                   This->asio_current_buffersize, 
-                   (double)This->asio_current_buffersize * 1000.0 / This->asio_sample_rate,
-                   This->asio_sample_rate);
-            /* Verbose debug disabled for cleaner output */
-            /* printf("Worker: Connecting PipeWire filter with rate=%f, channels=%d\n", This->asio_sample_rate, This->asio_active_outputs); */
-            
-            if (pw_filter_connect(This->pw_filter, PW_FILTER_FLAG_RT_PROCESS, connect_params, ARRAYSIZE(connect_params)) < 0) {
-                ERR("Worker: Failed to connect PipeWire filter\n");
-                printf("Worker: Failed to connect PipeWire filter\n");
-                result = -1;
-            } else {
-                TRACE("Worker: PipeWire filter connected successfully\n");
-                /* Keep success message for important operations */
-                printf("Worker: PipeWire filter connected successfully\n");
-            }
+            TRACE("Worker: Connecting PipeWire filter with %d samples (%.2f ms) at %.0f Hz\n",
+                  This->asio_current_buffersize,
+                  (double)This->asio_current_buffersize * 1000.0 / This->asio_sample_rate,
+                  This->asio_sample_rate);
+
+    if (pw_filter_connect(This->pw_filter, PW_FILTER_FLAG_RT_PROCESS, connect_params, ARRAYSIZE(connect_params)) < 0) {
+        ERR("Worker: Failed to connect PipeWire filter\n");
+        set_last_error("Worker failed to connect PipeWire filter");
+        result = -1;
+    } else {
+        TRACE("Worker: PipeWire filter connected successfully\n");
+    }
+
             break;
         }
         default:
             WARN("Worker: Unknown operation type: %d\n", operation);
-            printf("Worker: Unknown operation type: %d\n", operation);
+            set_last_error("Worker received unknown operation");
             result = -1;
             break;
     }
     
-    /* Verbose debug disabled for cleaner output */
-    /* printf("Worker callback returning: %d\n", result); */
     return result;
 }
 
@@ -848,6 +1088,54 @@ static struct pw_filter_events const pw_filter_events = {
     .remove_buffer = pipewire_remove_buffer_callback,
     .process = pipewire_process_callback,
 };
+
+/*****************************************************************************
+ * WineASIO instance creation
+ */
+
+HRESULT WINAPI WineASIOCreateInstance(REFIID riid, LPVOID *ppobj, IUnknown *cls_factory)
+{
+    IWineASIOImpl   *pobj;
+
+    /* TRACE("riid: %s, ppobj: %p\n", debugstr_guid(riid), ppobj); */
+
+    pobj = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*pobj));
+    if (pobj == NULL)
+    {
+        WARN("out of memory\n");
+        return E_OUTOFMEMORY;
+    }
+
+    pobj->lpVtbl = &WineASIO_Vtbl;
+    pobj->ref = 1;
+    pobj->cls_factory = cls_factory;
+    cls_factory->lpVtbl->AddRef(cls_factory);
+    pobj->asio_driver_state = Loaded;
+    pobj->asio_sample_rate = PW_ASIO_DEFAULT_SAMPLE_RATE;
+    pobj->asio_current_buffersize = ASIO_PREFERRED_BUFFERSIZE;
+    pobj->wineasio_preferred_buffersize = ASIO_PREFERRED_BUFFERSIZE;
+    pobj->wineasio_number_inputs = PW_ASIO_DEFAULT_INPUT_CHANNELS;
+    pobj->wineasio_number_outputs = PW_ASIO_DEFAULT_OUTPUT_CHANNELS;
+    pobj->wineasio_number_midi_inputs = PW_ASIO_DEFAULT_MIDI_INPUTS;
+    pobj->wineasio_number_midi_outputs = PW_ASIO_DEFAULT_MIDI_OUTPUTS;
+    pobj->wineasio_connect_to_hardware = true;
+    pobj->wineasio_fixed_buffersize = false;
+    pobj->midi_input_ports = NULL;
+    pobj->midi_output_ports = NULL;
+    pobj->midi_buffers_initialized = false;
+    pobj->midi_buffer_bytes = PW_ASIO_MIDI_BUFFER_BYTES;
+
+    midi_buffer_init(&pobj->midi_in_buffer);
+    midi_buffer_init(&pobj->midi_out_buffer);
+    pobj->midi_buffers_initialized = true;
+    pobj->asio_version = 1;
+    pobj->node_resolve_thread = NULL;
+    pobj->node_resolve_stop = 0;
+    TRACE("pobj = %p\n", pobj);
+    *ppobj = pobj;
+    /* TRACE("return %p\n", *ppobj); */
+    return S_OK;
+}
 
 /*****************************************************************************
  * Interface method definitions
@@ -909,29 +1197,41 @@ HIDDEN ULONG STDMETHODCALLTYPE Release(LPWINEASIO iface)
 
     if (This->asio_driver_state == Initialized)
     {
-        /* just for good measure we deinitialize IOChannel structures and unregister JACK ports */
+        /* just for good measure we deinitialize IOChannel structures */
         for (int i = 0; i < This->wineasio_number_inputs; i++)
         {
-            //jack_port_unregister (This->jack_client, This->input_channel[i].port);
             This->input_channel[i].active = false;
         }
         for (int i = 0; i < This->wineasio_number_outputs; i++)
         {
-            //jack_port_unregister (This->jack_client, This->output_channel[i].port);
             This->output_channel[i].active = false;
         }
         This->asio_active_inputs = This->asio_active_outputs = 0;
         TRACE("%i IOChannel structures released\n", This->wineasio_number_inputs + This->wineasio_number_outputs);
 
-        //jack_free (This->jack_output_ports);
-        //jack_free (This->jack_input_ports);
-        //jack_client_close(This->jack_client);
         if (This->input_channel)
             HeapFree(GetProcessHeap(), 0, This->input_channel);
+        This->input_channel = NULL;
+        This->output_channel = NULL;
+
+        if (This->midi_input_ports) {
+            HeapFree(GetProcessHeap(), 0, This->midi_input_ports);
+            This->midi_input_ports = NULL;
+            This->midi_output_ports = NULL;
+        }
+
+        /* Cleanup PipeWire resources */
+        Uninit(This);
     }
     if (ref == 0) {
         /* Cleanup ASIO callback manager on final release */
         cleanup_asio_callback_manager();
+
+        if (This->midi_buffers_initialized) {
+            midi_buffer_destroy(&This->midi_in_buffer);
+            midi_buffer_destroy(&This->midi_out_buffer);
+            This->midi_buffers_initialized = false;
+        }
         
         TRACE("PipeWine terminated\n\n");
         This->cls_factory->lpVtbl->Release(This->cls_factory);
@@ -941,7 +1241,37 @@ HIDDEN ULONG STDMETHODCALLTYPE Release(LPWINEASIO iface)
 }
 
 static void Uninit(IWineASIOImpl *This) {
-    // TODOOOO
+    if (!This) return;
+
+    if (This->node_resolve_thread) {
+        InterlockedExchange(&This->node_resolve_stop, 1);
+        WaitForSingleObject(This->node_resolve_thread, 2000);
+        CloseHandle(This->node_resolve_thread);
+        This->node_resolve_thread = NULL;
+    }
+
+    /* Cleanup PipeWire filter if exists */
+    if (This->pw_filter) {
+        user_pw_lock_loop(This->pw_helper);
+        pw_filter_disconnect(This->pw_filter);
+        user_pw_unlock_loop(This->pw_helper);
+        pw_filter_destroy(This->pw_filter);
+        This->pw_filter = NULL;
+    }
+
+    /* Cleanup PipeWire helper */
+    if (This->pw_helper) {
+        user_pw_destroy_helper(This->pw_helper);
+        This->pw_helper = NULL;
+    }
+
+    /* Reset state */
+    This->pw_loop = NULL;
+    This->pw_context = NULL;
+    This->pw_core = NULL;
+    This->current_input_node = NULL;
+    This->current_output_node = NULL;
+    This->node_resolve_stop = 0;
 }
 
 /* Helper function to clear all audio buffers for clean state transitions */
@@ -981,9 +1311,6 @@ static void clear_audio_buffers(IWineASIOImpl *This, const char *context) {
     }
     
     TRACE("Cleared %d audio buffers (%s)\n", cleared_buffers, context);
-    if (cleared_buffers > 0) {
-        printf("Cleared %d audio buffers (%s) - preventing audio distortion\n", cleared_buffers, context);
-    }
 }
 
 static ASIOError InitPorts(IWineASIOImpl *This) {
@@ -991,11 +1318,13 @@ static ASIOError InitPorts(IWineASIOImpl *This) {
     char pod_buffer[0x1000];
     struct spa_pod_builder pod_builder;
 
+    printf("PipeWine ASIO: InitPorts() starting\n");
     /* Allocate IOChannel structures */
     This->input_channel = HeapAlloc(GetProcessHeap(), 0, (This->wineasio_number_inputs + This->wineasio_number_outputs) * sizeof(IOChannel));
     if (!This->input_channel)
     {
         ERR("Unable to allocate IOChannel structures for %i channels\n", This->wineasio_number_inputs + This->wineasio_number_outputs);
+        set_last_error("Unable to allocate IOChannel structures");
         return ASE_NoMemory;
     }
     This->output_channel = This->input_channel + This->wineasio_number_inputs;
@@ -1009,9 +1338,7 @@ static ASIOError InitPorts(IWineASIOImpl *This) {
             SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
             SPA_PARAM_BUFFERS_buffers, SPA_POD_Int(2),
             SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
-            // TODO: Check
             SPA_PARAM_BUFFERS_dataType, SPA_POD_Int(SPA_DATA_MemPtr),
-            //SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_MemPtr),
             SPA_PARAM_BUFFERS_size, SPA_POD_CHOICE_STEP_Int(
                 This->asio_current_buffersize * sizeof(float),
                 This->asio_current_buffersize * sizeof(float),
@@ -1027,11 +1354,8 @@ static ASIOError InitPorts(IWineASIOImpl *This) {
         ),
     };
 
-    //char port_name[32];
     #define INPUT_PORT_PREFIX "input_"
-    //memcpy(port_name, INPUT_PORT_PREFIX, sizeof(INPUT_PORT_PREFIX));
     for (idx = 0; idx < This->wineasio_number_inputs; ++idx) {
-        //snprintf(port_name + sizeof(INPUT_PORT_PREFIX), sizeof(port_name) - sizeof(INPUT_PORT_PREFIX), "%d", idx);
         snprintf(This->input_channel[idx].port_name, ASIO_MAX_NAME_LENGTH, INPUT_PORT_PREFIX "%d", idx);
         
         /* Initialize Wine buffer management fields */
@@ -1051,9 +1375,7 @@ static ASIOError InitPorts(IWineASIOImpl *This) {
             port_params, ARRAYSIZE(port_params));
     }
     #define OUTPUT_PORT_PREFIX "output_"
-    //memcpy(port_name, OUTPUT_PORT_PREFIX, sizeof(OUTPUT_PORT_PREFIX));
     for (idx = 0; idx < This->wineasio_number_outputs; ++idx) {
-        //snprintf(port_name + sizeof(OUTPUT_PORT_PREFIX), sizeof(port_name) - sizeof(OUTPUT_PORT_PREFIX), "%d", idx);
         snprintf(This->output_channel[idx].port_name, ASIO_MAX_NAME_LENGTH, OUTPUT_PORT_PREFIX "%d", idx);
         
         /* Initialize Wine buffer management fields */
@@ -1074,6 +1396,77 @@ static ASIOError InitPorts(IWineASIOImpl *This) {
     }
     TRACE("%i IOChannel structures initialized\n", This->wineasio_number_inputs + This->wineasio_number_outputs);
 
+    if (This->wineasio_number_midi_inputs > 0 || This->wineasio_number_midi_outputs > 0) {
+        int midi_total = This->wineasio_number_midi_inputs + This->wineasio_number_midi_outputs;
+        This->midi_input_ports = HeapAlloc(GetProcessHeap(), 0, midi_total * sizeof(MidiPort));
+        if (!This->midi_input_ports) {
+            ERR("Unable to allocate MidiPort structures for %i ports\n", midi_total);
+            set_last_error("Unable to allocate MidiPort structures");
+            return ASE_NoMemory;
+        }
+        This->midi_output_ports = This->midi_input_ports + This->wineasio_number_midi_inputs;
+
+        char midi_pod_buffer[0x1000];
+        struct spa_pod_builder midi_builder = SPA_POD_BUILDER_INIT(midi_pod_buffer, sizeof midi_pod_buffer);
+
+        struct spa_pod const *midi_port_params[] = {
+            spa_pod_builder_add_object(&midi_builder,
+                SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+                SPA_PARAM_BUFFERS_buffers, SPA_POD_Int(2),
+                SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
+                SPA_PARAM_BUFFERS_dataType, SPA_POD_Int(SPA_DATA_MemPtr),
+                SPA_PARAM_BUFFERS_size, SPA_POD_CHOICE_STEP_Int(
+                    (int)This->midi_buffer_bytes,
+                    (int)This->midi_buffer_bytes,
+                    (int)This->midi_buffer_bytes,
+                    16
+                ),
+                SPA_PARAM_BUFFERS_stride, SPA_POD_Int(1)
+            ),
+            spa_pod_builder_add_object(&midi_builder,
+                SPA_TYPE_OBJECT_ParamIO, SPA_PARAM_IO,
+                SPA_PARAM_IO_id, SPA_POD_Id(SPA_IO_Buffers),
+                SPA_PARAM_IO_size, SPA_POD_Int(sizeof(struct spa_io_buffers))
+            ),
+            spa_pod_builder_add_object(&midi_builder,
+                SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
+                SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_application),
+                SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_control),
+                SPA_FORMAT_CONTROL_types, SPA_POD_CHOICE_FLAGS_Int(1 << SPA_CONTROL_Midi)
+            ),
+        };
+
+        #define MIDI_INPUT_PORT_PREFIX "midi_in_"
+        for (idx = 0; idx < This->wineasio_number_midi_inputs; ++idx) {
+            snprintf(This->midi_input_ports[idx].port_name, ASIO_MAX_NAME_LENGTH, MIDI_INPUT_PORT_PREFIX "%d", idx);
+            This->midi_input_ports[idx].active = true;
+            This->midi_input_ports[idx].port = pw_filter_add_port(This->pw_filter,
+                PW_DIRECTION_INPUT,
+                PW_FILTER_PORT_FLAG_MAP_BUFFERS,
+                0,
+                pw_properties_new(
+                    PW_KEY_PORT_NAME, This->midi_input_ports[idx].port_name,
+                    PW_KEY_FORMAT_DSP, JACK_DEFAULT_MIDI_TYPE,
+                    NULL),
+                midi_port_params, ARRAYSIZE(midi_port_params));
+        }
+        #define MIDI_OUTPUT_PORT_PREFIX "midi_out_"
+        for (idx = 0; idx < This->wineasio_number_midi_outputs; ++idx) {
+            snprintf(This->midi_output_ports[idx].port_name, ASIO_MAX_NAME_LENGTH, MIDI_OUTPUT_PORT_PREFIX "%d", idx);
+            This->midi_output_ports[idx].active = true;
+            This->midi_output_ports[idx].port = pw_filter_add_port(This->pw_filter,
+                PW_DIRECTION_OUTPUT,
+                PW_FILTER_PORT_FLAG_MAP_BUFFERS,
+                0,
+                pw_properties_new(
+                    PW_KEY_PORT_NAME, This->midi_output_ports[idx].port_name,
+                    PW_KEY_FORMAT_DSP, JACK_DEFAULT_MIDI_TYPE,
+                    NULL),
+                midi_port_params, ARRAYSIZE(midi_port_params));
+        }
+    }
+
+    printf("PipeWine ASIO: InitPorts() completed\n");
     return ASE_OK;
 }
 
@@ -1103,12 +1496,15 @@ HIDDEN ASIOBool STDMETHODCALLTYPE Init(LPWINEASIO iface, void *sysRef)
 
     if (!(This->pw_helper = user_pw_create_helper(0, NULL, &init_args)))
     {
+        set_last_error("Failed to initialize PipeWire helper");
         return ASIOFalse;
     }
 
+    printf("PipeWine ASIO: Helper created, registering worker callback\n");
     /* Register the worker callback for deferred PipeWire operations */
     user_pw_set_worker_callback(pipewire_worker_callback);
 
+    printf("PipeWine ASIO: Setting up GUI config\n");
     This->gui = NULL;
     This->gui_conf.user = This;
     This->gui_conf.closed = GuiClosed;
@@ -1117,16 +1513,16 @@ HIDDEN ASIOBool STDMETHODCALLTYPE Init(LPWINEASIO iface, void *sysRef)
     This->gui_conf.pw_helper = This->pw_helper;
     This->gui_conf.cf_buffer_size = 1024;
 
+    printf("PipeWine ASIO: Getting nodes by name\n");
     get_nodes_by_name(This);
+    ensure_nodes_ready_async(This);
 
     if (This->current_input_node)
         TRACE("Selected input node: %u\n", pw_proxy_get_bound_id((struct pw_proxy *)This->current_input_node));
     if (This->current_output_node)
         TRACE("Selected output node: %u\n", pw_proxy_get_bound_id((struct pw_proxy *)This->current_output_node));
 
-    //This->asio_sample_rate = jack_get_sample_rate(This->jack_client);
-    //This->asio_current_buffersize = jack_get_buffer_size(This->jack_client);
-
+    printf("PipeWine ASIO: Locking PipeWire loop\n");
     user_pw_lock_loop(This->pw_helper);
 
     This->pw_filter = pw_filter_new(This->pw_core, This->client_name, pw_properties_new(
@@ -1138,54 +1534,24 @@ HIDDEN ASIOBool STDMETHODCALLTYPE Init(LPWINEASIO iface, void *sysRef)
     ));
 
     if (!This->pw_filter) {
+        user_pw_unlock_loop(This->pw_helper);
         ERR("Failed to create filter node\n");
+        set_last_error("Failed to create PipeWire filter node");
         return ASIOFalse;
     }
 
     pw_filter_add_listener(This->pw_filter, &This->pw_filter_listener, &pw_filter_events, This);
 
-    InitPorts(This);
+    if (InitPorts(This) != ASE_OK) {
+        user_pw_unlock_loop(This->pw_helper);
+        set_last_error("Failed to initialize PipeWire ports");
+        return ASIOFalse;
+    }
 
     user_pw_unlock_loop(This->pw_helper);
 
-    #if 0
-    jack_set_thread_creator(jack_thread_creator);
-
-    if (jack_set_buffer_size_callback(This->jack_client, jack_buffer_size_callback, This))
-    {
-        Uninit(This);
-        HeapFree(GetProcessHeap(), 0, This->input_channel);
-        ERR("Unable to register JACK buffer size change callback\n");
-        return ASIOFalse;
-    }
-    
-    if (jack_set_latency_callback(This->jack_client, jack_latency_callback, This))
-    {
-        Uninit(This);
-        HeapFree(GetProcessHeap(), 0, This->input_channel);
-        ERR("Unable to register JACK latency callback\n");
-        return ASIOFalse;
-    }
-
-
-    if (jack_set_process_callback(This->jack_client, jack_process_callback, This))
-    {
-        jack_client_close(This->jack_client);
-        HeapFree(GetProcessHeap(), 0, This->input_channel);
-        ERR("Unable to register JACK process callback\n");
-        return ASIOFalse;
-    }
-
-    if (jack_set_sample_rate_callback (This->jack_client, jack_sample_rate_callback, This))
-    {
-        jack_client_close(This->jack_client);
-        HeapFree(GetProcessHeap(), 0, This->input_channel);
-        ERR("Unable to register JACK sample rate change callback\n");
-        return ASIOFalse;
-    }
-    #endif
-
     This->asio_driver_state = Initialized;
+    printf("PipeWine ASIO: Init() completed successfully!\n");
     TRACE("PipeWine 0.%d.%d initialized\n", This->asio_version / 10, This->asio_version % 10);
     return ASIOTrue;
 }
@@ -1226,15 +1592,17 @@ DEFINE_THISCALL_WRAPPER(GetErrorMessage,8)
 HIDDEN void STDMETHODCALLTYPE GetErrorMessage(LPWINEASIO iface, char *string)
 {
     TRACE("iface: %p, string: %p)\n", iface, string);
-    strcpy(string, "PipeWine does not return error messages\n");
-    return;
+    if (string) {
+        strncpy(string, g_last_error, 124);
+        string[123] = '\0';
+    }
 }
 
 /*
  * ASIOError Start(void);
- *  Function:    Start JACK IO processing and reset the sample counter to zero
+ *  Function:    Start PipeWire IO processing and reset the sample counter to zero
  *  Returns:     ASE_NotPresent if IO is missing
- *               ASE_HWMalfunction if JACK fails to start
+ *               ASE_HWMalfunction if PipeWire fails to start
  */
 
 DEFINE_THISCALL_WRAPPER(Start,4)
@@ -1244,11 +1612,17 @@ HIDDEN ASIOError STDMETHODCALLTYPE Start(LPWINEASIO iface)
 
     TRACE("iface: %p\n", iface);
 
-    if (This->asio_driver_state != Prepared)
+    if (This->asio_driver_state != Prepared) {
+        set_last_error("Driver is not prepared");
         return ASE_NotPresent;
+    }
 
     /* Clear and resync all buffers to prevent distorted audio on restart */
     clear_audio_buffers(This, "driver start");
+    if (This->midi_buffers_initialized) {
+        midi_buffer_clear(&This->midi_in_buffer);
+        midi_buffer_clear(&This->midi_out_buffer);
+    }
 
     /* Activate the PipeWire filter for streaming */
     user_pw_lock_loop(This->pw_helper);
@@ -1260,6 +1634,7 @@ HIDDEN ASIOError STDMETHODCALLTYPE Start(LPWINEASIO iface)
     TRACE("Waiting for PipeWire filter to reach streaming state (timeout: %d ms)...\n", streaming_timeout);
     if (!user_pw_wait_for_filter_state(This->pw_helper, This->pw_filter, PW_FILTER_STATE_STREAMING, streaming_timeout)) {
         WARN("Filter did not reach streaming state within timeout, continuing anyway\n");
+        set_last_error("Filter did not reach streaming state within timeout");
         /* Don't fail - some configurations may work without reaching streaming immediately */
     } else {
         TRACE("PipeWire filter successfully reached streaming state\n");
@@ -1268,8 +1643,8 @@ HIDDEN ASIOError STDMETHODCALLTYPE Start(LPWINEASIO iface)
     /* Initialize ASIO timing and buffer state - ensure clean restart */
     This->asio_buffer_index = 0;
     This->asio_sample_position = 0;
-    /* Initialize timestamp in microseconds (not nanoseconds!) */
-    This->asio_time_stamp = timeGetTime() * 1000ULL; /* Convert milliseconds to microseconds */
+    /* Initialize timestamp in nanoseconds */
+    This->asio_time_stamp = timeGetTime() * 1000000ULL; /* Convert milliseconds to nanoseconds */
 
     /* Prepare ASIO timing structures */
     if (This->asio_time_info_mode) {
@@ -1280,7 +1655,7 @@ HIDDEN ASIOError STDMETHODCALLTYPE Start(LPWINEASIO iface)
 
         if (This->asio_can_time_code) {
             This->asio_time.timeCode.speed = 1;
-            This->asio_time.timeCode.timeCodeSamples = ASIO_LONG(ASIOSamples, This->asio_time_stamp);
+            This->asio_time.timeCode.timeCodeSamples = ASIO_LONG(ASIOSamples, This->asio_sample_position);
             This->asio_time.timeCode.flags = ~(kTcValid | kTcRunning);
         }
     }
@@ -1288,13 +1663,12 @@ HIDDEN ASIOError STDMETHODCALLTYPE Start(LPWINEASIO iface)
     /* Set driver state to Running - this enables the process callback */
     This->asio_driver_state = Running;
     TRACE("PipeWine successfully started with clean buffers\n");
-    printf("PipeWine successfully started with clean buffers\n");
     return ASE_OK;
 }
 
 /*
  * ASIOError Stop(void);
- *  Function:   Stop JACK IO processing
+ *  Function:   Stop PipeWire IO processing
  *  Returns:    ASE_NotPresent on missing IO
  *  Note:       BufferSwitch() must not called after returning
  */
@@ -1306,8 +1680,10 @@ HIDDEN ASIOError STDMETHODCALLTYPE Stop(LPWINEASIO iface)
 
     TRACE("iface: %p\n", iface);
 
-    if (This->asio_driver_state != Running)
+    if (This->asio_driver_state != Running) {
+        set_last_error("Driver is not running");
         return ASE_NotPresent;
+    }
 
     /* Deactivate the PipeWire filter first to stop audio processing */
     user_pw_lock_loop(This->pw_helper);
@@ -1316,6 +1692,10 @@ HIDDEN ASIOError STDMETHODCALLTYPE Stop(LPWINEASIO iface)
 
     /* Clear buffers to ensure clean state for next start */
     clear_audio_buffers(This, "driver stop");
+    if (This->midi_buffers_initialized) {
+        midi_buffer_clear(&This->midi_in_buffer);
+        midi_buffer_clear(&This->midi_out_buffer);
+    }
 
     /* Reset buffer index to ensure consistent state */
     This->asio_buffer_index = 0;
@@ -1323,7 +1703,6 @@ HIDDEN ASIOError STDMETHODCALLTYPE Stop(LPWINEASIO iface)
     This->asio_driver_state = Prepared;
 
     TRACE("PipeWine stopped with clean buffer state\n");
-    printf("PipeWine stopped with clean buffer state\n");
     return ASE_OK;
 }
 
@@ -1365,10 +1744,6 @@ HIDDEN ASIOError STDMETHODCALLTYPE GetLatencies(LPWINEASIO iface, LONG *inputLat
     if (This->asio_driver_state == Loaded)
         return ASE_NotPresent;
 
-    /*jack_port_get_latency_range(This->input_channel[0].port, JackCaptureLatency, &range);
-    *inputLatency = range.max;
-    jack_port_get_latency_range(This->output_channel[0].port, JackPlaybackLatency, &range);
-    *outputLatency = range.max;*/
     TRACE("iface: %p, input latency: %d, output latency: %d\n", iface, *inputLatency, *outputLatency);
 
     *inputLatency = This->asio_current_buffersize;
@@ -1420,11 +1795,10 @@ DEFINE_THISCALL_WRAPPER(CanSampleRate,12)
 HIDDEN ASIOError STDMETHODCALLTYPE CanSampleRate(LPWINEASIO iface, ASIOSampleRate sampleRate)
 {
     IWineASIOImpl   *This = (IWineASIOImpl*)iface;
+    (void)This;
 
     TRACE("iface: %p, Samplerate = %li, requested samplerate = %li\n", iface, (long) This->asio_sample_rate, (long) sampleRate);
 
-    //if (sampleRate != This->asio_sample_rate)
-    //    return ASE_NoClock;
     return ASE_OK;
 }
 
@@ -1588,39 +1962,19 @@ HIDDEN ASIOError STDMETHODCALLTYPE CreateBuffers(LPWINEASIO iface, ASIOBufferInf
 {
     IWineASIOImpl   *This = (IWineASIOImpl*)iface;
     ASIOBufferInfo  *buffer_info = bufferInfo;
-    ASIOError        status;
-    int             i, j, k;
+    int             i;
 
     TRACE("iface: %p, driver state: %d, bufferInfo: %p, numChannels: %i, bufferSize: %i, asioCallbacks: %p\n", iface, This->asio_driver_state, bufferInfo, (int)numChannels, (int)bufferSize, asioCallbacks);
 
-    if (This->asio_driver_state != Initialized)
+    if (This->asio_driver_state != Initialized) {
+        set_last_error("Driver is not initialized");
         return ASE_NotPresent;
-
-    if (!bufferInfo || !asioCallbacks)
-        return ASE_InvalidMode;
-
-    /* Check for invalid channel numbers */
-    #if 0
-    for (i = j = k = 0; i < numChannels; i++, buffer_info++)
-    {
-        if (buffer_info->isInput)
-        {
-            if (j++ >= This->wineasio_number_inputs)
-            {
-                WARN("Invalid input channel requested\n");
-                return ASE_InvalidMode;
-            }
-        }
-        else
-        {
-            if (k++  >= This->wineasio_number_outputs)
-            {
-                WARN("Invalid output channel requested\n");
-                return ASE_InvalidMode;
-            }
-        }
     }
-    #endif
+
+    if (!bufferInfo || !asioCallbacks) {
+        set_last_error("Invalid buffer creation parameters");
+        return ASE_InvalidMode;
+    }
 
     /* set buf_size - always use our configured buffer size */
     if (This->wineasio_fixed_buffersize)
@@ -1629,18 +1983,9 @@ HIDDEN ASIOError STDMETHODCALLTYPE CreateBuffers(LPWINEASIO iface, ASIOBufferInf
         {
             TRACE("ASIO application requested %d samples, but driver is configured for %d samples\n", 
                   (int)bufferSize, (int)This->asio_current_buffersize);
-            printf("ASIO application requested %d samples, but driver is configured for %d samples\n", 
-                   (int)bufferSize, (int)This->asio_current_buffersize);
-            
             /* Force the application to use our configured buffer size */
-            printf("Forcing ASIO application to use configured buffer size: %d samples\n", 
-                   (int)This->asio_current_buffersize);
-            
-            /* Don't return error - instead force our buffer size */
-            /* return ASE_InvalidMode; */
         }
         TRACE("Buffersize fixed at %i\n", (int)This->asio_current_buffersize);
-        printf("Using fixed buffer size: %d samples\n", (int)This->asio_current_buffersize);
     }
     else
     { /* fail if out of range */
@@ -1648,6 +1993,7 @@ HIDDEN ASIOError STDMETHODCALLTYPE CreateBuffers(LPWINEASIO iface, ASIOBufferInf
             && bufferSize <= ASIO_MAXIMUM_BUFFERSIZE))
         {
             WARN("Invalid buffersize %i requested\n", (int)bufferSize);
+            set_last_error("Invalid buffer size %d requested", (int)bufferSize);
             return ASE_InvalidMode;
         }
 
@@ -1658,9 +2004,8 @@ HIDDEN ASIOError STDMETHODCALLTYPE CreateBuffers(LPWINEASIO iface, ASIOBufferInf
         else
         {
             /* Use our configured buffer size instead of what the application requested */
-            printf("ASIO application requested %d samples, using configured %d samples instead\n", 
-                   (int)bufferSize, (int)This->asio_current_buffersize);
-            TRACE("Buffer size forced to configured value: %i\n", (int)This->asio_current_buffersize);
+            TRACE("Buffer size forced to configured value: %i (requested %i)\n",
+                  (int)This->asio_current_buffersize, (int)bufferSize);
         }
     }
 
@@ -1696,15 +2041,6 @@ HIDDEN ASIOError STDMETHODCALLTYPE CreateBuffers(LPWINEASIO iface, ASIOBufferInf
     buffer_info = bufferInfo;
     This->asio_active_inputs = This->asio_active_outputs = 0;
 
-    #if 0
-    for (i = 0; i < This->wineasio_number_inputs; i++) {
-        This->input_channel[i].active = false;
-    }
-    for (i = 0; i < This->wineasio_number_outputs; i++) {
-        This->output_channel[i].active = false;
-    }
-    #endif
-
     for (i = 0; i < numChannels; i++, buffer_info++)
     {
         IOChannel *chan;
@@ -1726,11 +2062,28 @@ HIDDEN ASIOError STDMETHODCALLTYPE CreateBuffers(LPWINEASIO iface, ASIOBufferInf
 
     /* Connect PipeWire filter only if not already connected */
     if (This->pw_filter && pw_filter_get_state(This->pw_filter, NULL) == PW_FILTER_STATE_UNCONNECTED) {
-        /* PipeWire quantum should be pre-configured by GUI for optimal sync */
-        printf("Connecting filter with %d samples (quantum should be pre-configured)\n", This->asio_current_buffersize);
-        
+        /* Set quantum to match ASIO buffer size */
+        char rate_str[32], latency_str[32];
+        uint32_t quantum = This->asio_current_buffersize;
+        uint32_t rate = (uint32_t)This->asio_sample_rate;
+
+        snprintf(rate_str, sizeof(rate_str), "%u/%u", quantum, rate);
+        snprintf(latency_str, sizeof(latency_str), "%u/%u", quantum, rate);
+
+        printf("Setting PipeWire filter quantum to %u samples (%.2f ms @ %u Hz)\n",
+               quantum, (double)quantum * 1000.0 / rate, rate);
+
+        const struct spa_dict_item items[] = {
+            { PW_KEY_NODE_RATE, rate_str },
+            { PW_KEY_NODE_LATENCY, latency_str },
+        };
+        const struct spa_dict dict = SPA_DICT_INIT(items, 2);
+        pw_filter_update_properties(This->pw_filter, NULL, &dict);
+
+        TRACE("Connecting filter with %d samples quantum\n", This->asio_current_buffersize);
+
         char pod_buffer[0x1000];
-        struct spa_pod_builder pod_builder = SPA_POD_BUILDER_INIT(pod_buffer, sizeof pod_buffer);
+        struct spa_pod_builder pod_builder = SPA_POD_BUILDER_INIT(pod_buffer, sizeof(pod_buffer));
         struct spa_audio_info_raw format = SPA_AUDIO_INFO_RAW_INIT(
             .format = SPA_AUDIO_FORMAT_F32,
             .rate = This->asio_sample_rate,
@@ -1755,21 +2108,21 @@ HIDDEN ASIOError STDMETHODCALLTYPE CreateBuffers(LPWINEASIO iface, ASIOBufferInf
         };
         
         TRACE("Connecting PipeWire filter with rate=%f, channels=%d\n", This->asio_sample_rate, This->asio_active_outputs);
-        printf("Connecting PipeWire filter with %d samples (%.2f ms) at %.0f Hz\n", 
-               This->asio_current_buffersize, 
-               (double)This->asio_current_buffersize * 1000.0 / This->asio_sample_rate,
-               This->asio_sample_rate);
+        TRACE("Connecting PipeWire filter with %d samples (%.2f ms) at %.0f Hz\n", 
+              This->asio_current_buffersize, 
+              (double)This->asio_current_buffersize * 1000.0 / This->asio_sample_rate,
+              This->asio_sample_rate);
         
         user_pw_lock_loop(This->pw_helper);
         if (pw_filter_connect(This->pw_filter, PW_FILTER_FLAG_RT_PROCESS, connect_params, ARRAYSIZE(connect_params)) < 0) {
             user_pw_unlock_loop(This->pw_helper);
             ERR("Failed to connect PipeWire filter\n");
+            set_last_error("Failed to connect PipeWire filter");
             return ASE_HWMalfunction;
         }
         user_pw_unlock_loop(This->pw_helper);
         
         TRACE("PipeWire filter connected successfully\n");
-        printf("PipeWire filter connected successfully\n");
     } else if (This->pw_filter) {
         TRACE("PipeWire filter already connected, state: %s\n", 
               pw_filter_state_as_string(pw_filter_get_state(This->pw_filter, NULL)));
@@ -1778,15 +2131,12 @@ HIDDEN ASIOError STDMETHODCALLTYPE CreateBuffers(LPWINEASIO iface, ASIOBufferInf
     /* Wait for filter to reach paused state - use longer timeout for small buffer sizes */
     int paused_timeout = (bufferSize <= 128) ? 15000 : 10000;
     TRACE("Waiting for PipeWire filter to reach paused state (timeout: %d ms)...\n", paused_timeout);
-    printf("Waiting for PipeWire filter to reach paused state (buffer size: %d, timeout: %d ms)...\n", 
-           (int)bufferSize, paused_timeout);
     if (!user_pw_wait_for_filter_state(This->pw_helper, This->pw_filter, PW_FILTER_STATE_PAUSED, paused_timeout)) {
         ERR("Timeout waiting for PipeWire filter to reach paused state\n");
-        printf("Timeout waiting for PipeWire filter to reach paused state\n");
+        set_last_error("Timeout waiting for PipeWire filter to reach paused state");
         return ASE_HWMalfunction;
     }
     TRACE("PipeWire filter successfully reached paused state\n");
-    printf("PipeWire filter successfully reached paused state\n");
 
     buffer_info = bufferInfo;
     for (i = 0; i < numChannels; i++, buffer_info++)
@@ -1815,7 +2165,16 @@ HIDDEN ASIOError STDMETHODCALLTYPE CreateBuffers(LPWINEASIO iface, ASIOBufferInf
         chan->wine_buffers[1] = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, aligned_size);
         
         if (!chan->wine_buffers[0] || !chan->wine_buffers[1]) {
+            if (chan->wine_buffers[0]) {
+                HeapFree(GetProcessHeap(), 0, chan->wine_buffers[0]);
+                chan->wine_buffers[0] = NULL;
+            }
+            if (chan->wine_buffers[1]) {
+                HeapFree(GetProcessHeap(), 0, chan->wine_buffers[1]);
+                chan->wine_buffers[1] = NULL;
+            }
             ERR("Failed to allocate Wine-compatible buffers for channel %d\n", i);
+            set_last_error("Failed to allocate audio buffers");
             return ASE_NoMemory;
         }
         
@@ -1836,42 +2195,14 @@ HIDDEN ASIOError STDMETHODCALLTYPE CreateBuffers(LPWINEASIO iface, ASIOBufferInf
     /* Ensure all newly allocated buffers are clean for consistent initial state */
     clear_audio_buffers(This, "buffer creation");
 
-    #if 0
-    This->callback_audio_buffer = HeapAlloc(GetProcessHeap(), 0,
-        (This->wineasio_number_inputs + This->wineasio_number_outputs) * 2 * This->asio_current_buffersize * sizeof(jack_default_audio_sample_t));
-    if (!This->callback_audio_buffer)
-    {
-        ERR("Unable to allocate %i ASIO audio buffers\n", This->wineasio_number_inputs + This->wineasio_number_outputs);
-        return ASE_NoMemory;
-    }
-    TRACE("%i ASIO audio buffers allocated (%i kB)\n", This->wineasio_number_inputs + This->wineasio_number_outputs,
-          (int) ((This->wineasio_number_inputs + This->wineasio_number_outputs) * 2 * This->asio_current_buffersize * sizeof(jack_default_audio_sample_t) / 1024));
-
-    #endif
-
-    //if (jack_activate(This->jack_client))
-    //    return ASE_NotPresent;
-
-    /* connect to the hardware io */
-    if (This->wineasio_connect_to_hardware)
-    {
-        #if 0
-        for (i = 0; i < This->jack_num_input_ports && i < This->wineasio_number_inputs; i++)
-            if (strstr(jack_port_type(jack_port_by_name(This->jack_client, This->jack_input_ports[i])), "audio"))
-                jack_connect(This->jack_client, This->jack_input_ports[i], jack_port_name(This->input_channel[i].port));
-        for (i = 0; i < This->jack_num_output_ports && i < This->wineasio_number_outputs; i++)
-            if (strstr(jack_port_type(jack_port_by_name(This->jack_client, This->jack_output_ports[i])), "audio"))
-                jack_connect(This->jack_client, jack_port_name(This->output_channel[i].port), This->jack_output_ports[i]);
-        #endif
-    }
-
     /* Initialize ASIO callback manager for Wine thread marshalling */
     if (!init_asio_callback_manager(This)) {
         ERR("Failed to initialize ASIO callback manager\n");
+        set_last_error("Failed to initialize ASIO callback manager");
         return ASE_HWMalfunction;
     }
 
-    /* at this point all the connections are made and the jack process callback is outputting silence */
+    /* at this point all the connections are made and the PipeWire process callback is outputting silence */
     This->asio_driver_state = Prepared;
     return ASE_OK;
 }
@@ -1894,8 +2225,10 @@ HIDDEN ASIOError STDMETHODCALLTYPE DisposeBuffers(LPWINEASIO iface)
 
     if (This->asio_driver_state == Running)
         Stop (iface);
-    if (This->asio_driver_state != Prepared)
+    if (This->asio_driver_state != Prepared) {
+        set_last_error("Driver is not prepared");
         return ASE_NotPresent;
+    }
 
     /* Properly disconnect and destroy the PipeWire filter */
     if (This->pw_filter) {
@@ -1949,8 +2282,22 @@ HIDDEN ASIOError STDMETHODCALLTYPE DisposeBuffers(LPWINEASIO iface)
     }
     This->asio_active_inputs = This->asio_active_outputs = 0;
 
-    //if (This->callback_audio_buffer)
-    //    HeapFree(GetProcessHeap(), 0, This->callback_audio_buffer);
+    if (This->midi_input_ports) {
+        for (i = 0; i < This->wineasio_number_midi_inputs; i++) {
+            This->midi_input_ports[i].active = false;
+            This->midi_input_ports[i].port = NULL;
+        }
+    }
+    if (This->midi_output_ports) {
+        for (i = 0; i < This->wineasio_number_midi_outputs; i++) {
+            This->midi_output_ports[i].active = false;
+            This->midi_output_ports[i].port = NULL;
+        }
+    }
+    if (This->midi_buffers_initialized) {
+        midi_buffer_clear(&This->midi_in_buffer);
+        midi_buffer_clear(&This->midi_out_buffer);
+    }
 
     /* Cleanup ASIO callback manager */
     cleanup_asio_callback_manager();
@@ -1970,7 +2317,8 @@ DEFINE_THISCALL_WRAPPER(ControlPanel,4)
 HIDDEN ASIOError STDMETHODCALLTYPE ControlPanel(LPWINEASIO iface)
 {
     IWineASIOImpl   *This = (IWineASIOImpl *)iface;
-    puts("OPENING CONTROL PANEL!!!");
+
+    TRACE("Opening control panel\n");
 
     if (This->gui == NULL) {
         This->gui = pwasio_init_gui(&This->gui_conf);
@@ -1990,41 +2338,36 @@ HIDDEN void GuiApplyConfig(struct pwasio_gui_conf *conf)
     IWineASIOImpl   *This = (IWineASIOImpl *)conf->user;
     
     TRACE("Applying GUI configuration changes\n");
-    printf("GUI: Applying configuration changes - driver state: %d\n", This->asio_driver_state);
-    printf("GUI: Current buffer size: %ld, requested: %u\n", This->wineasio_preferred_buffersize, conf->cf_buffer_size);
+    TRACE("GUI config: state=%d, buffer=%ld -> %u\n", This->asio_driver_state,
+          This->wineasio_preferred_buffersize, conf->cf_buffer_size);
     
-    // Update buffer size preference and current buffer size
+    /* Update buffer size preference and current buffer size */
     if (This->wineasio_preferred_buffersize != conf->cf_buffer_size) {
         TRACE("Changing buffer size from %ld to %u\n", This->wineasio_preferred_buffersize, conf->cf_buffer_size);
-        printf("GUI: Changing buffer size from %ld to %u\n", This->wineasio_preferred_buffersize, conf->cf_buffer_size);
         This->wineasio_preferred_buffersize = conf->cf_buffer_size;
         
-        // Also update the current buffer size if driver is not in a prepared/running state
-        // If buffers are already created, we need to notify the host to recreate them
+        /* Also update the current buffer size if driver is not in a prepared/running state */
         if (This->asio_driver_state == Initialized || This->asio_driver_state == Loaded) {
             This->asio_current_buffersize = conf->cf_buffer_size;
-            TRACE("Updated current buffer size to %u\n", conf->cf_buffer_size);
-            printf("GUI: Updated current buffer size to %u (driver not prepared)\n", conf->cf_buffer_size);
+            TRACE("Updated current buffer size to %u (driver not prepared)\n", conf->cf_buffer_size);
         } else if (This->asio_driver_state == Prepared || This->asio_driver_state == Running) {
-            // Update current buffer size immediately
+            /* Update current buffer size immediately */
             This->asio_current_buffersize = conf->cf_buffer_size;
             TRACE("Updated current buffer size to %u (driver prepared/running)\n", conf->cf_buffer_size);
-            printf("GUI: Updated current buffer size to %u (driver prepared/running)\n", conf->cf_buffer_size);
             
-            // If PipeWire filter is connected, we need to reconnect it with the new buffer size
+            /* If PipeWire filter is connected, reconnect it with the new buffer size */
             if (This->pw_filter && pw_filter_get_state(This->pw_filter, NULL) != PW_FILTER_STATE_UNCONNECTED) {
                 TRACE("Reconnecting PipeWire filter with new buffer size\n");
-                printf("GUI: Reconnecting PipeWire filter with new buffer size\n");
                 
-                // Disconnect the current filter
+                /* Disconnect the current filter */
                 user_pw_lock_loop(This->pw_helper);
                 pw_filter_disconnect(This->pw_filter);
                 user_pw_unlock_loop(This->pw_helper);
                 
-                // Wait for disconnection
+                /* Wait for disconnection */
                 user_pw_wait_for_filter_state(This->pw_helper, This->pw_filter, PW_FILTER_STATE_UNCONNECTED, 5000);
                 
-                // Reconnect with new buffer size
+                /* Reconnect with new buffer size */
                 char pod_buffer[0x1000];
                 struct spa_pod_builder pod_builder = SPA_POD_BUILDER_INIT(pod_buffer, sizeof pod_buffer);
                 struct spa_audio_info_raw format = SPA_AUDIO_INFO_RAW_INIT(
@@ -2050,65 +2393,75 @@ HIDDEN void GuiApplyConfig(struct pwasio_gui_conf *conf)
                     ),
                 };
                 
-                printf("GUI: Reconnecting PipeWire with new quantum: %d samples (%.2f ms) at %.0f Hz\n", 
-                       This->asio_current_buffersize, 
-                       (double)This->asio_current_buffersize * 1000.0 / This->asio_sample_rate,
-                       This->asio_sample_rate);
-                
+                TRACE("GUI: Reconnecting PipeWire with new quantum: %d samples (%.2f ms) at %.0f Hz\n",
+                      This->asio_current_buffersize,
+                      (double)This->asio_current_buffersize * 1000.0 / This->asio_sample_rate,
+                      This->asio_sample_rate);
+
+                /* Set quantum to match new ASIO buffer size */
+                char rate_str[32], latency_str[32];
+                uint32_t quantum = This->asio_current_buffersize;
+                uint32_t rate = (uint32_t)This->asio_sample_rate;
+                snprintf(rate_str, sizeof(rate_str), "%u/%u", quantum, rate);
+                snprintf(latency_str, sizeof(latency_str), "%u/%u", quantum, rate);
+
                 user_pw_lock_loop(This->pw_helper);
+                const struct spa_dict_item items2[] = {
+                    { PW_KEY_NODE_RATE, rate_str },
+                    { PW_KEY_NODE_LATENCY, latency_str },
+                };
+                const struct spa_dict dict2 = SPA_DICT_INIT(items2, 2);
+                pw_filter_update_properties(This->pw_filter, NULL, &dict2);
+
                 if (pw_filter_connect(This->pw_filter, PW_FILTER_FLAG_RT_PROCESS, connect_params, ARRAYSIZE(connect_params)) < 0) {
                     user_pw_unlock_loop(This->pw_helper);
                     ERR("Failed to reconnect PipeWire filter with new buffer size\n");
-                    printf("GUI: ERROR - Failed to reconnect PipeWire filter with new buffer size\n");
+                    set_last_error("Failed to reconnect PipeWire filter with new buffer size");
                 } else {
                     user_pw_unlock_loop(This->pw_helper);
                     
-                    // Wait for filter to reach paused state
+                    /* Wait for filter to reach paused state */
                     if (user_pw_wait_for_filter_state(This->pw_helper, This->pw_filter, PW_FILTER_STATE_PAUSED, 10000)) {
                         TRACE("PipeWire filter successfully reconnected with new buffer size\n");
-                        printf("GUI: PipeWire filter successfully reconnected with new buffer size\n");
                     } else {
                         ERR("Timeout waiting for PipeWire filter to reach paused state after reconnection\n");
-                        printf("GUI: ERROR - Timeout waiting for PipeWire filter to reach paused state after reconnection\n");
+                        set_last_error("Timeout waiting for PipeWire filter after buffer size change");
                     }
                 }
             } else {
-                printf("GUI: PipeWire filter not connected or already disconnected\n");
+                TRACE("PipeWire filter not connected or already disconnected\n");
             }
             
-            // Buffers are already created, need to notify host about buffer size change
+            /* Buffers are already created, need to notify host about buffer size change */
             if (This->asio_callbacks && This->asio_callbacks->asioMessage(kAsioSelectorSupported, kAsioBufferSizeChange, 0, 0)) {
                 TRACE("Requesting ASIO buffer size change notification\n");
-                printf("GUI: Requesting ASIO buffer size change notification\n");
                 This->asio_callbacks->asioMessage(kAsioBufferSizeChange, 0, 0, 0);
             } else {
-                printf("GUI: ASIO callbacks not available or buffer size change not supported\n");
+                TRACE("ASIO callbacks not available or buffer size change not supported\n");
             }
         }
     } else {
-        printf("GUI: Buffer size unchanged (%u samples)\n", conf->cf_buffer_size);
+        TRACE("GUI: Buffer size unchanged (%u samples)\n", conf->cf_buffer_size);
     }
     
-    // Apply sample rate change if different
+    /* Apply sample rate change if different */
     if (This->asio_sample_rate != conf->cf_sample_rate) {
         TRACE("Changing sample rate from %.0f to %u\n", This->asio_sample_rate, conf->cf_sample_rate);
-        printf("GUI: Changing sample rate from %.0f to %u\n", This->asio_sample_rate, conf->cf_sample_rate);
         This->asio_sample_rate = conf->cf_sample_rate;
         
-        // If PipeWire filter is connected, we need to reconnect it with the new sample rate
+        /* If PipeWire filter is connected, reconnect it with the new sample rate */
         if (This->pw_filter && pw_filter_get_state(This->pw_filter, NULL) != PW_FILTER_STATE_UNCONNECTED) {
             TRACE("Reconnecting PipeWire filter with new sample rate\n");
-            printf("GUI: Reconnecting PipeWire filter with new sample rate\n");
             
-            // Disconnect the current filter
+            /* Disconnect the current filter */
             user_pw_lock_loop(This->pw_helper);
             pw_filter_disconnect(This->pw_filter);
             user_pw_unlock_loop(This->pw_helper);
             
-            // Wait for disconnection
+            /* Wait for disconnection */
             user_pw_wait_for_filter_state(This->pw_helper, This->pw_filter, PW_FILTER_STATE_UNCONNECTED, 5000);
             
-            // Reconnect with new sample rate
+            /* Reconnect with new sample rate */
             char pod_buffer[0x1000];
             struct spa_pod_builder pod_builder = SPA_POD_BUILDER_INIT(pod_buffer, sizeof pod_buffer);
             struct spa_audio_info_raw format = SPA_AUDIO_INFO_RAW_INIT(
@@ -2134,41 +2487,55 @@ HIDDEN void GuiApplyConfig(struct pwasio_gui_conf *conf)
                 ),
             };
             
-            printf("GUI: Reconnecting PipeWire with new sample rate: %.0f Hz (buffer: %d samples)\n", 
-                   This->asio_sample_rate, This->asio_current_buffersize);
-            
+            TRACE("GUI: Reconnecting PipeWire with new sample rate: %.0f Hz (buffer: %d samples)\n",
+                  This->asio_sample_rate, This->asio_current_buffersize);
+
+            /* Set quantum to match ASIO buffer size with new sample rate */
+            char rate_str[32], latency_str[32];
+            uint32_t quantum = This->asio_current_buffersize;
+            uint32_t rate = (uint32_t)This->asio_sample_rate;
+            snprintf(rate_str, sizeof(rate_str), "%u/%u", quantum, rate);
+            snprintf(latency_str, sizeof(latency_str), "%u/%u", quantum, rate);
+
+            const struct spa_dict_item items3[] = {
+                { PW_KEY_NODE_RATE, rate_str },
+                { PW_KEY_NODE_LATENCY, latency_str },
+            };
+            const struct spa_dict dict3 = SPA_DICT_INIT(items3, 2);
+
             user_pw_lock_loop(This->pw_helper);
+            pw_filter_update_properties(This->pw_filter, NULL, &dict3);
+
             if (pw_filter_connect(This->pw_filter, PW_FILTER_FLAG_RT_PROCESS, connect_params, ARRAYSIZE(connect_params)) < 0) {
                 user_pw_unlock_loop(This->pw_helper);
                 ERR("Failed to reconnect PipeWire filter with new sample rate\n");
-                printf("GUI: ERROR - Failed to reconnect PipeWire filter with new sample rate\n");
+                set_last_error("Failed to reconnect PipeWire filter with new sample rate");
             } else {
                 user_pw_unlock_loop(This->pw_helper);
                 
-                // Wait for filter to reach paused state
+                /* Wait for filter to reach paused state */
                 if (user_pw_wait_for_filter_state(This->pw_helper, This->pw_filter, PW_FILTER_STATE_PAUSED, 10000)) {
                     TRACE("PipeWire filter successfully reconnected with new sample rate\n");
-                    printf("GUI: PipeWire filter successfully reconnected with new sample rate\n");
                 } else {
                     ERR("Timeout waiting for PipeWire filter to reach paused state after sample rate change\n");
-                    printf("GUI: ERROR - Timeout waiting for PipeWire filter to reach paused state after sample rate change\n");
+                    set_last_error("Timeout waiting for PipeWire filter after sample rate change");
                 }
             }
         } else {
-            printf("GUI: PipeWire filter not connected, sample rate will be applied on next connection\n");
+            TRACE("PipeWire filter not connected, sample rate will be applied on next connection\n");
         }
         
-        // If the driver is running, notify the ASIO host about the sample rate change
+        /* If the driver is running, notify the ASIO host about the sample rate change */
         if (This->asio_driver_state == Running && This->asio_callbacks) {
-            if (This->asio_callbacks->asioMessage(kAsioSelectorSupported, kAsioResetRequest, 0, 0)) {
-                TRACE("Requesting ASIO reset due to sample rate change\n");
-                printf("GUI: Requesting ASIO reset due to sample rate change\n");
-                This->asio_callbacks->asioMessage(kAsioResetRequest, 0, 0, 0);
-            }
+        if (This->asio_callbacks->asioMessage(kAsioSelectorSupported, kAsioResetRequest, 0, 0)) {
+            TRACE("Requesting ASIO reset due to sample rate change\n");
+            This->asio_callbacks->asioMessage(kAsioResetRequest, 0, 0, 0);
+        }
+
         }
     }
     
-    // Apply input/output channel changes
+    /* Apply input/output channel changes */
     if (This->wineasio_number_inputs != conf->cf_input_channels) {
         TRACE("Changing input channels from %d to %u\n", This->wineasio_number_inputs, conf->cf_input_channels);
         This->wineasio_number_inputs = conf->cf_input_channels;
@@ -2179,14 +2546,13 @@ HIDDEN void GuiApplyConfig(struct pwasio_gui_conf *conf)
         This->wineasio_number_outputs = conf->cf_output_channels;
     }
     
-    // Apply auto-connect setting
+    /* Apply auto-connect setting */
     This->wineasio_connect_to_hardware = conf->cf_auto_connect;
-    
-    // Save the updated configuration to file
-    store_config(This);
+
+    /* Save the updated configuration to file */
+    configure_driver(This);
     
     TRACE("GUI configuration applied successfully\n");
-    printf("GUI: Configuration applied successfully - new current buffer size: %ld\n", This->asio_current_buffersize);
 }
 
 HIDDEN void GuiLoadConfig(struct pwasio_gui_conf *conf)
@@ -2223,6 +2589,68 @@ HIDDEN ASIOError STDMETHODCALLTYPE Future(LPWINEASIO iface, LONG selector, void 
 
     switch (selector)
     {
+        case PW_ASIO_MIDI_SELECTOR_GET_INFO: {
+            if (!opt) {
+                return ASE_InvalidParameter;
+            }
+            PWASIO_MidiInfo *info = (PWASIO_MidiInfo *)opt;
+            info->api_version = PW_ASIO_MIDI_API_VERSION;
+            info->num_inputs = (uint32_t)This->wineasio_number_midi_inputs;
+            info->num_outputs = (uint32_t)This->wineasio_number_midi_outputs;
+            return ASE_SUCCESS;
+        }
+        case PW_ASIO_MIDI_SELECTOR_GET_INPUT: {
+            if (!opt || !This->midi_buffers_initialized || This->wineasio_number_midi_inputs <= 0) {
+                return ASE_InvalidParameter;
+            }
+            PWASIO_MidiBuffer *buf = (PWASIO_MidiBuffer *)opt;
+            if (!buf->events || buf->capacity == 0) {
+                buf->count = 0;
+                return ASE_InvalidParameter;
+            }
+
+            uint32_t read_count = 0;
+            struct midi_event ev;
+            while (read_count < buf->capacity && midi_buffer_read(&This->midi_in_buffer, &ev)) {
+                PWASIO_MidiEvent *out = &buf->events[read_count];
+                out->offset = ev.offset;
+                out->size = ev.size;
+                out->port = ev.port;
+                memset(out->reserved, 0, sizeof(out->reserved));
+                memset(out->data, 0, sizeof(out->data));
+                if (ev.size > 0) {
+                    memcpy(out->data, ev.data, ev.size);
+                }
+                read_count++;
+            }
+            buf->count = read_count;
+            return ASE_SUCCESS;
+        }
+        case PW_ASIO_MIDI_SELECTOR_PUT_OUTPUT: {
+            if (!opt || !This->midi_buffers_initialized || This->wineasio_number_midi_outputs <= 0) {
+                return ASE_InvalidParameter;
+            }
+            PWASIO_MidiBuffer *buf = (PWASIO_MidiBuffer *)opt;
+            if (!buf->events || buf->count == 0) {
+                buf->count = 0;
+                return ASE_SUCCESS;
+            }
+
+            uint32_t accepted = 0;
+            for (uint32_t i = 0; i < buf->count; ++i) {
+                PWASIO_MidiEvent *ev = &buf->events[i];
+                if (ev->port >= (uint8_t)This->wineasio_number_midi_outputs) {
+                    continue;
+                }
+                if (!midi_buffer_write(&This->midi_out_buffer, ev->port, ev->offset, ev->data, ev->size)) {
+                    break;
+                }
+                accepted++;
+            }
+
+            buf->count = accepted;
+            return ASE_SUCCESS;
+        }
         case kAsioEnableTimeCodeRead:
             This->asio_can_time_code = TRUE;
             TRACE("The ASIO host enabled TimeCode\n");
@@ -2304,114 +2732,9 @@ HIDDEN ASIOError STDMETHODCALLTYPE OutputReady(LPWINEASIO iface)
 }
 
 /****************************************************************************
- *  JACK callbacks
+ *  Support functions
  */
 
-static inline int jack_buffer_size_callback(jack_nframes_t nframes, void *arg)
-{
-    IWineASIOImpl   *This = (IWineASIOImpl*)arg;
-
-    if(This->asio_driver_state != Running)
-        return 0;
-
-    if (This->asio_callbacks->asioMessage(kAsioSelectorSupported, kAsioResetRequest, 0 , 0))
-        This->asio_callbacks->asioMessage(kAsioResetRequest, 0, 0, 0);
-    return 0;
-}
-
-static inline void jack_latency_callback(jack_latency_callback_mode_t mode, void *arg)
-{
-    IWineASIOImpl   *This = (IWineASIOImpl*)arg;
-
-    if(This->asio_driver_state != Running)
-        return;
-
-    if (This->asio_callbacks->asioMessage(kAsioSelectorSupported, kAsioLatenciesChanged, 0 , 0))
-        This->asio_callbacks->asioMessage(kAsioLatenciesChanged, 0, 0, 0);
-
-    return;
-}
-
-#if 0
-static inline int jack_process_callback(jack_nframes_t nframes, void *arg)
-{
-    IWineASIOImpl               *This = (IWineASIOImpl*)arg;
-
-    int                         i;
-    jack_transport_state_t      jack_transport_state;
-    jack_position_t             jack_position;
-    DWORD                       time;
-
-    /* output silence if the ASIO callback isn't running yet */
-    if (This->asio_driver_state != Running)
-    {
-        for (i = 0; i < This->asio_active_outputs; i++)
-            bzero(jack_port_get_buffer(This->output_channel[i].port, nframes), sizeof (jack_default_audio_sample_t) * nframes);
-        return 0;
-    }
-
-    /* copy jack to asio buffers */
-    for (i = 0; i < This->wineasio_number_inputs; i++)
-        if (This->input_channel[i].active)
-            memcpy (&This->input_channel[i].audio_buffer[nframes * This->asio_buffer_index],
-                    jack_port_get_buffer(This->input_channel[i].port, nframes),
-                    sizeof (jack_default_audio_sample_t) * nframes);
-
-    if (This->asio_sample_position.lo > ULONG_MAX - nframes)
-        This->asio_sample_position.hi++;
-    This->asio_sample_position.lo += nframes;
-
-    time = timeGetTime();
-    This->asio_time_stamp.lo = time * 1000000;
-    This->asio_time_stamp.hi = ((unsigned long long) time * 1000000) >> 32;
-
-    if (This->asio_time_info_mode) /* use the newer bufferSwitchTimeInfo method if supported */
-    {
-        This->asio_time.timeInfo.samplePosition.lo = This->asio_sample_position.lo;
-        This->asio_time.timeInfo.samplePosition.hi = This->asio_sample_position.hi;
-        This->asio_time.timeInfo.systemTime.lo = This->asio_time_stamp.lo;
-        This->asio_time.timeInfo.systemTime.hi = This->asio_time_stamp.hi;
-        This->asio_time.timeInfo.sampleRate = This->asio_sample_rate;
-        This->asio_time.timeInfo.flags = kSystemTimeValid | kSamplePositionValid | kSampleRateValid;
-
-        if (This->asio_can_time_code) /* FIXME addionally use time code if supported */
-        {
-            jack_transport_state = jack_transport_query(This->jack_client, &jack_position);
-            This->asio_time.timeCode.flags = kTcValid;
-            if (jack_transport_state == JackTransportRolling)
-                This->asio_time.timeCode.flags |= kTcRunning;
-        }
-        This->asio_callbacks->bufferSwitchTimeInfo(&This->asio_time, This->asio_buffer_index, ASIOTrue);
-    }
-    else
-    { /* use the old bufferSwitch method */
-        This->asio_callbacks->bufferSwitch(This->asio_buffer_index, ASIOTrue);
-    }
-
-    /* copy asio to jack buffers */
-    for (i = 0; i < This->wineasio_number_outputs; i++)
-        if (This->output_channel[i].active)
-            memcpy(jack_port_get_buffer(This->output_channel[i].port, nframes),
-                    &This->output_channel[i].audio_buffer[nframes * This->asio_buffer_index],
-                    sizeof (jack_default_audio_sample_t) * nframes);
-
-    /* swith asio buffer */
-    This->asio_buffer_index = This->asio_buffer_index ? 0 : 1;
-    return 0;
-}
-#endif
-
-static inline int jack_sample_rate_callback(jack_nframes_t nframes, void *arg)
-{
-    IWineASIOImpl   *This = (IWineASIOImpl*)arg;
-
-    if(This->asio_driver_state != Running)
-        return 0;
-
-    This->asio_sample_rate = nframes;
-    This->asio_callbacks->sampleRateDidChange(nframes);
-    return 0;
-}
 
 /*****************************************************************************
  *  Support functions
@@ -2427,7 +2750,7 @@ static WCHAR *strrchrW(const WCHAR* str, WCHAR ch)
 }
 #endif
 
-/* Function called by JACK to create a thread in the wine process context,
+/* Function called by PipeWire to create a thread in the wine process context,
  *  uses the global structure jack_thread_creator_privates to communicate with jack_thread_creator_helper() */
 static int jack_thread_creator(pthread_t* thread_id, const pthread_attr_t* attr, void *(*function)(void*), void* arg)
 {
@@ -2436,7 +2759,7 @@ static int jack_thread_creator(pthread_t* thread_id, const pthread_attr_t* attr,
     jack_thread_creator_privates.jack_callback_thread = function;
     jack_thread_creator_privates.arg = arg;
     jack_thread_creator_privates.jack_callback_thread_created = CreateEventW(NULL, FALSE, FALSE, NULL);
-    CreateThread( NULL, 0, jack_thread_creator_helper, arg, 0,0 );
+    CreateThread(NULL, 0, jack_thread_creator_helper, arg, 0, 0);
     WaitForSingleObject(jack_thread_creator_privates.jack_callback_thread_created, INFINITE);
     *thread_id = jack_thread_creator_privates.jack_callback_pthread_id;
     return 0;
@@ -2464,16 +2787,23 @@ static void get_nodes_by_name(IWineASIOImpl *This) {
     if (This->pwasio_input_device_name[0]) {
         required_len = WideCharToMultiByte(CP_UTF8, 0, This->pwasio_input_device_name, -1, NULL, 0, NULL, NULL);
         if (required_len == 0) {
-            fputs("ERROR: Failed to convert input device name to UTF-8\n", stderr);
+            ERR("Failed to convert input device name to UTF-8\n");
         } else {
             if (namebuf_len < required_len) {
                 free(namebuf);
                 namebuf = malloc(required_len);
+                if (!namebuf) {
+                    ERR("Failed to allocate memory for input device name\n");
+                    set_last_error("Failed to allocate memory for input device name");
+                    return;
+                }
                 namebuf_len = required_len;
             }
             if (0 == WideCharToMultiByte(CP_UTF8, 0, This->pwasio_input_device_name, -1, namebuf, namebuf_len, NULL, NULL)) {
-                // Should never happen.
-                abort();
+                ERR("Failed to convert input device name to UTF-8\n");
+                set_last_error("Failed to convert input device name to UTF-8");
+                free(namebuf);
+                return;
             }
             This->current_input_node = user_pw_find_node_by_name(This->pw_helper, namebuf);
         }
@@ -2482,16 +2812,23 @@ static void get_nodes_by_name(IWineASIOImpl *This) {
     if (This->pwasio_output_device_name[0]) {
         required_len = WideCharToMultiByte(CP_UTF8, 0, This->pwasio_output_device_name, -1, NULL, 0, NULL, NULL);
         if (required_len == 0) {
-            fputs("ERROR: Failed to convert output device name to UTF-8\n", stderr);
+            ERR("Failed to convert output device name to UTF-8\n");
         } else {
             if (namebuf_len < required_len) {
                 free(namebuf);
                 namebuf = malloc(required_len);
+                if (!namebuf) {
+                    ERR("Failed to allocate memory for output device name\n");
+                    set_last_error("Failed to allocate memory for output device name");
+                    return;
+                }
                 namebuf_len = required_len;
             }
             if (0 == WideCharToMultiByte(CP_UTF8, 0, This->pwasio_output_device_name, -1, namebuf, namebuf_len, NULL, NULL)) {
-                // Should never happen.
-                abort();
+                ERR("Failed to convert output device name to UTF-8\n");
+                set_last_error("Failed to convert output device name to UTF-8");
+                free(namebuf);
+                return;
             }
             This->current_output_node = user_pw_find_node_by_name(This->pw_helper, namebuf);
         }
@@ -2500,10 +2837,10 @@ static void get_nodes_by_name(IWineASIOImpl *This) {
     free(namebuf);
 
     if (This->current_input_node == NULL) {
-        This->current_input_node = user_pw_get_default_node(This->pw_helper, SPA_DIRECTION_INPUT);
+        This->current_input_node = user_pw_get_default_node_nonblocking(This->pw_helper, SPA_DIRECTION_INPUT);
     }
     if (This->current_output_node == NULL) {
-        This->current_output_node = user_pw_get_default_node(This->pw_helper, SPA_DIRECTION_OUTPUT);
+        This->current_output_node = user_pw_get_default_node_nonblocking(This->pw_helper, SPA_DIRECTION_OUTPUT);
     }
 }
 
@@ -2527,6 +2864,22 @@ static void parse_boolean_env(char const *env, bool *var) {
         *var = false;
 }
 
+static int sanitize_channel_count(char const *label, int value, int default_value) {
+    if (value <= 0 || value > PW_ASIO_MAX_CHANNELS) {
+        WARN("Invalid %s channel count %d, using default %d\n", label, value, default_value);
+        return default_value;
+    }
+    return value;
+}
+
+static int sanitize_midi_port_count(char const *label, int value, int default_value) {
+    if (value < 0 || value > PW_ASIO_MAX_MIDI_PORTS) {
+        WARN("Invalid %s MIDI port count %d, using default %d\n", label, value, default_value);
+        return default_value;
+    }
+    return value;
+}
+
 /* Unicode strings used for the registry */
 static const WCHAR key_software_wine_pwasio[] = u"Software\\Wine\\PipeWine";
 static const WCHAR value_pwasio_number_inputs[] = u"Number of inputs";
@@ -2537,89 +2890,25 @@ static const WCHAR value_pwasio_connect_to_hardware[] = u"Connect to hardware";
 static const WCHAR value_pwasio_input_device[] = u"Input device";
 static const WCHAR value_pwasio_output_device[] = u"Output device";
 
-static void store_config(IWineASIOImpl *This) {
+static void configure_driver(IWineASIOImpl *This) {
     HKEY  hkey;
     LONG  result;
-    DWORD bool_value;
+    LONG  status;
+    DWORD size;
+    DWORD type;
+    DWORD value;
+    WCHAR application_path[MAX_PATH];
+    WCHAR *application_name;
+    char environment_variable[MAX_ENVIRONMENT_SIZE];
 
     /* create registry entries with defaults if not present */
     result = RegCreateKeyExW(HKEY_CURRENT_USER, key_software_wine_pwasio, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hkey, NULL);
-
-    result = RegSetValueExW(hkey, value_pwasio_number_inputs, 0, REG_DWORD, (LPBYTE) &This->wineasio_number_inputs, sizeof(This->wineasio_number_inputs));
-    result = RegSetValueExW(hkey, value_pwasio_number_outputs, 0, REG_DWORD, (LPBYTE) &This->wineasio_number_outputs, sizeof(This->wineasio_number_outputs));
-    result = RegSetValueExW(hkey, value_pwasio_buffersize, 0, REG_DWORD, (LPBYTE) &This->wineasio_preferred_buffersize, sizeof(This->wineasio_preferred_buffersize));
-    bool_value = This->wineasio_fixed_buffersize;
-    result = RegSetValueExW(hkey, value_pwasio_buffersize_fixed, 0, REG_DWORD, (LPBYTE) &bool_value, sizeof(bool_value));
-    bool_value = This->wineasio_connect_to_hardware;
-    result = RegSetValueExW(hkey, value_pwasio_connect_to_hardware, 0, REG_DWORD, (LPBYTE) &bool_value, sizeof(bool_value));
-    result = RegSetValueExW(hkey, value_pwasio_input_device, 0, REG_SZ, (LPBYTE) &This->pwasio_input_device_name, sizeof(This->pwasio_input_device_name));
-    result = RegSetValueExW(hkey, value_pwasio_output_device, 0, REG_SZ, (LPBYTE) &This->pwasio_output_device_name, sizeof(This->pwasio_output_device_name));
-}
-
-/* Allocate the interface pointer and associate it with the vtbl/WineASIO object */
-HRESULT WINAPI WineASIOCreateInstance(REFIID riid, LPVOID *ppobj, IUnknown *cls_factory)
-{
-    IWineASIOImpl   *pobj;
-
-    /* TRACE("riid: %s, ppobj: %p\n", debugstr_guid(riid), ppobj); */
-
-    pobj = HeapAlloc(GetProcessHeap(), 0, sizeof(*pobj));
-    if (pobj == NULL)
-    {
-        WARN("out of memory\n");
-        return E_OUTOFMEMORY;
+    if (result != ERROR_SUCCESS) {
+        ERR("Failed to open registry key for configuration (%d)\n", (int)result);
+        set_last_error("Failed to open registry key for configuration");
+        return;
     }
 
-    pobj->lpVtbl = &WineASIO_Vtbl;
-    pobj->ref = 1;
-    pobj->cls_factory = cls_factory;
-    cls_factory->lpVtbl->AddRef(cls_factory);
-    TRACE("pobj = %p\n", pobj);
-    *ppobj = pobj;
-    /* TRACE("return %p\n", *ppobj); */
-    return S_OK;
-}
-
-static VOID configure_driver(IWineASIOImpl *This)
-{
-    HKEY    hkey;
-    LONG    result, value;
-    LSTATUS status;
-    DWORD   type, size;
-    WCHAR   application_path [MAX_PATH];
-    WCHAR   *application_name;
-    char    environment_variable[MAX_ENVIRONMENT_SIZE];
-
-    /* Initialise most member variables,
-     * asio_sample_position, asio_time, & asio_time_stamp are initialized in Start()
-     * jack_num_input_ports & jack_num_output_ports are initialized in Init() */
-    This->asio_active_inputs = 0;
-    This->asio_active_outputs = 0;
-    This->asio_buffer_index = 0;
-    This->asio_callbacks = NULL;
-    This->asio_can_time_code = FALSE;
-    This->asio_driver_state = Loaded;
-    This->asio_sample_rate = 48000; /* Default to 48kHz sample rate */
-    This->asio_time_info_mode = FALSE;
-    This->asio_version = 10;
-
-    This->wineasio_number_inputs = 16;
-    This->wineasio_number_outputs = 16;
-    This->wineasio_autostart_server = FALSE;
-    This->wineasio_connect_to_hardware = TRUE;
-    This->wineasio_fixed_buffersize = TRUE;  /* Force fixed buffer size for stable timing */
-    This->wineasio_preferred_buffersize = ASIO_PREFERRED_BUFFERSIZE;
-    This->asio_current_buffersize = This->wineasio_preferred_buffersize;
-    
-    printf("DEBUG: Initial buffer size set to %d (from ASIO_PREFERRED_BUFFERSIZE)\n", This->asio_current_buffersize);
-
-    This->client_name[0] = 0;
-    //This->callback_audio_buffer = NULL;
-    This->input_channel = NULL;
-    This->output_channel = NULL;
-
-    /* create registry entries with defaults if not present */
-    result = RegCreateKeyExW(HKEY_CURRENT_USER, key_software_wine_pwasio, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hkey, NULL);
 
     /* get/set number of asio inputs */
     size = sizeof(DWORD);
@@ -2671,8 +2960,8 @@ static VOID configure_driver(IWineASIOImpl *This)
     if (RegQueryValueExW(hkey, value_pwasio_buffersize, NULL, &type, (LPBYTE) &value, &size) == ERROR_SUCCESS)
     {
         if (type == REG_DWORD) {
-            printf("DEBUG: Registry override - changing buffer size from %d to %d\n", 
-                   This->asio_current_buffersize, (int)value);
+            TRACE("Registry override - changing buffer size from %d to %d\n", 
+                  This->asio_current_buffersize, (int)value);
             This->wineasio_preferred_buffersize = value;
             /* Update current buffer size to match preferred size from registry */
             This->asio_current_buffersize = value;
@@ -2680,10 +2969,10 @@ static VOID configure_driver(IWineASIOImpl *This)
     }
     else
     {
-        printf("DEBUG: No registry buffer size found, keeping config/default value: %d\n", 
-               This->asio_current_buffersize);
-        printf("DEBUG: Creating registry entry with current buffer size: %d\n", 
-               This->wineasio_preferred_buffersize);
+        TRACE("No registry buffer size found, keeping config/default value: %d\n", 
+              This->asio_current_buffersize);
+        TRACE("Creating registry entry with current buffer size: %d\n", 
+              This->wineasio_preferred_buffersize);
         type = REG_DWORD;
         size = sizeof(DWORD);
         value = This->wineasio_preferred_buffersize;
@@ -2789,41 +3078,34 @@ static VOID configure_driver(IWineASIOImpl *This)
                 This->wineasio_preferred_buffersize = config_args.buffer_size;
                 This->asio_current_buffersize = config_args.buffer_size;
                 TRACE("Loaded buffer size from config: %u\n", config_args.buffer_size);
-                printf("Loaded buffer size from config: %u (overriding registry)\n", config_args.buffer_size);
-                printf("DEBUG: After config override - preferred: %d, current: %d\n", 
-                       This->wineasio_preferred_buffersize, This->asio_current_buffersize);
+                TRACE("Config override applied: preferred=%d, current=%d\n",
+                      This->wineasio_preferred_buffersize, This->asio_current_buffersize);
             }
             
             if (config_args.sample_rate > 0) {
                 This->asio_sample_rate = config_args.sample_rate;
                 TRACE("Loaded sample rate from config: %u\n", config_args.sample_rate);
-                printf("Loaded sample rate from config: %u\n", config_args.sample_rate);
             }
             
             if (config_args.num_input_channels > 0 && config_args.num_input_channels <= 64) {
                 This->wineasio_number_inputs = config_args.num_input_channels;
                 TRACE("Loaded input channels from config: %u\n", config_args.num_input_channels);
-                printf("Loaded input channels from config: %u\n", config_args.num_input_channels);
             }
             
             if (config_args.num_output_channels > 0 && config_args.num_output_channels <= 64) {
                 This->wineasio_number_outputs = config_args.num_output_channels;
                 TRACE("Loaded output channels from config: %u\n", config_args.num_output_channels);
-                printf("Loaded output channels from config: %u\n", config_args.num_output_channels);
             }
             
             This->wineasio_connect_to_hardware = config_args.auto_connect;
             TRACE("Loaded auto-connect from config: %s\n", config_args.auto_connect ? "true" : "false");
-            printf("Loaded auto-connect from config: %s\n", config_args.auto_connect ? "true" : "false");
-            
-            printf("Loaded configuration from: %s\n", config_paths[i]);
+            TRACE("Loaded configuration from: %s\n", config_paths[i]);
             break;
         }
     }
     
     if (!config_loaded) {
         TRACE("No configuration file found, using registry/defaults\n");
-        printf("No configuration file found, using registry/defaults\n");
     }
 
     /* Look for environment variables to override registry config values */
@@ -2842,6 +3124,22 @@ static VOID configure_driver(IWineASIOImpl *This)
         result = strtol(environment_variable, 0, 10);
         if (errno != ERANGE)
             This->wineasio_number_outputs = result;
+    }
+
+    if (GetEnvironmentVariableA("PWASIO_NUMBER_MIDI_INPUTS", environment_variable, MAX_ENVIRONMENT_SIZE))
+    {
+        errno = 0;
+        result = strtol(environment_variable, 0, 10);
+        if (errno != ERANGE)
+            This->wineasio_number_midi_inputs = result;
+    }
+
+    if (GetEnvironmentVariableA("PWASIO_NUMBER_MIDI_OUTPUTS", environment_variable, MAX_ENVIRONMENT_SIZE))
+    {
+        errno = 0;
+        result = strtol(environment_variable, 0, 10);
+        if (errno != ERANGE)
+            This->wineasio_number_midi_outputs = result;
     }
 
     if (GetEnvironmentVariableA("PWASIO_CONNECT_TO_HARDWARE", environment_variable, MAX_ENVIRONMENT_SIZE))
@@ -2872,6 +3170,15 @@ static VOID configure_driver(IWineASIOImpl *This)
         /* Update current buffer size to match corrected preferred size */
         This->asio_current_buffersize = ASIO_PREFERRED_BUFFERSIZE;
     }
+
+    This->wineasio_number_inputs = sanitize_channel_count(
+        "input", This->wineasio_number_inputs, PW_ASIO_DEFAULT_INPUT_CHANNELS);
+    This->wineasio_number_outputs = sanitize_channel_count(
+        "output", This->wineasio_number_outputs, PW_ASIO_DEFAULT_OUTPUT_CHANNELS);
+    This->wineasio_number_midi_inputs = sanitize_midi_port_count(
+        "input", This->wineasio_number_midi_inputs, PW_ASIO_DEFAULT_MIDI_INPUTS);
+    This->wineasio_number_midi_outputs = sanitize_midi_port_count(
+        "output", This->wineasio_number_midi_outputs, PW_ASIO_DEFAULT_MIDI_OUTPUTS);
 
 
 

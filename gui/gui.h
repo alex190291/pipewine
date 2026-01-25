@@ -7,33 +7,51 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/**
+ * @file gui.h
+ * @brief PipeWine ASIO GUI interface
+ *
+ * This header defines the interface between the ASIO driver and its
+ * Qt-based settings dialog.
+ */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 struct pwasio_gui;
 
-// The configuration shared between the GUI and its client.
+/**
+ * @brief GUI configuration structure
+ *
+ * Shared between the GUI and its client (the ASIO driver).
+ * The driver fills in the callbacks and configuration values,
+ * and the GUI updates them when the user makes changes.
+ */
 struct pwasio_gui_conf {
-	// Client's state pointer
-	void *user;
-	// Called when the GUI wants to close. Called after `apply_config`,
-	// if confirmed. The application should call pwasio_destroy_gui in
-	// response.
+	void *user;  /**< Client's state pointer (typically IWineASIOImpl*) */
+
+	/**
+	 * @brief Called when GUI wants to close
+	 * Called after apply_config if user confirmed. The application
+	 * should call pwasio_destroy_gui in response.
+	 */
 	void (*closed)(struct pwasio_gui_conf *gui);
-	// Apply the config using state in this struct.
+
+	/** @brief Apply configuration changes */
 	void (*apply_config)(struct pwasio_gui_conf *gui);
-	// The application should fill state in this struct with
-	// stored configuration, or with defaults if not available.
+
+	/** @brief Load current configuration into this struct */
 	void (*load_config)(struct pwasio_gui_conf *gui);
 
-	struct user_pw_helper *pw_helper;
-	// The state
-	uint32_t cf_buffer_size;
-	uint32_t cf_sample_rate;
-	uint32_t cf_input_channels;
-	uint32_t cf_output_channels;
-	bool cf_auto_connect;
+	struct user_pw_helper *pw_helper;  /**< PipeWire helper instance */
+
+	/* Configuration values */
+	uint32_t cf_buffer_size;      /**< Buffer size in samples */
+	uint32_t cf_sample_rate;      /**< Sample rate in Hz */
+	uint32_t cf_input_channels;   /**< Number of input channels */
+	uint32_t cf_output_channels;  /**< Number of output channels */
+	bool cf_auto_connect;         /**< Auto-connect to hardware */
 };
 
 // The config must persist for as long as the GUI is live.

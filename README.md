@@ -191,7 +191,28 @@ make 64
 
 ## 📄 License
 
-PipeWine is licensed under the [GNU Lesser General Public License v2.1](LICENSE) or later.
+### Copyright Notice
+
+```
+Copyright (C) 2006 Robert Reif
+Portions copyright (C) 2007 Ralf Beck
+Portions copyright (C) 2007 Johnny Petrantoni
+Portions copyright (C) 2007 Stephane Letz
+Portions copyright (C) 2008 William Steidtmann
+Portions copyright (C) 2010 Peter L Jones
+Portions copyright (C) 2010 Torben Hohn
+Portions copyright (C) 2010 Nedko Arnaudov
+Portions copyright (C) 2011 Christian Schoenebeck
+Portions copyright (C) 2013 Joakim Hernberg
+Portions copyright (C) 2020-2023 Filipe Coelho
+```
+
+### License Terms
+
+- **Library Code**: The WineASIO library code is licensed under **LGPL v2.1** or later. See `COPYING.LIB` for details.
+- **GUI Code**: The WineASIO settings UI code is licensed under **GPL v2+** or later. See `COPYING.GUI` for details.
+
+### LGPL v2.1 Permissions
 
 This allows:
 - ✅ Commercial use

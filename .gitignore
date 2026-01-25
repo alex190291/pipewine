@@ -50,3 +50,8 @@ mimetype
 # OS-specific files
 .DS_Store
 Thumbs.db
+
+# Agent/Development task files
+AGENT_TASK_*.md
+agent-*-findings.md
+REWORK.md

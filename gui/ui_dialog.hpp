@@ -1,7 +1,7 @@
 /********************************************************************************
 ** Form generated from reading UI file 'dialog.ui'
 **
-** Created by: Qt User Interface Compiler version 6.9.1
+** Created by: Qt User Interface Compiler version 6.10.1
 **
 ** WARNING! All changes made in this file will be lost when recompiling UI file!
 ********************************************************************************/
@@ -58,16 +58,11 @@ public:
         formLayout->setWidget(0, QFormLayout::ItemRole::LabelRole, label);
 
         bufferSize = new QComboBox(PwAsioDialog);
-        bufferSize->addItem(QString::fromUtf8("256"));
-        bufferSize->addItem(QString::fromUtf8("384"));
-        bufferSize->addItem(QString::fromUtf8("512"));
-        bufferSize->addItem(QString::fromUtf8("1024"));
-        bufferSize->addItem(QString::fromUtf8("2024"));
         bufferSize->setObjectName("bufferSize");
         bufferSize->setFocusPolicy(Qt::StrongFocus);
         bufferSize->setInputMethodHints(Qt::ImhDigitsOnly);
         bufferSize->setEditable(true);
-        bufferSize->setCurrentText(QString::fromUtf8("256"));
+        bufferSize->setCurrentText(QString::fromUtf8("1024"));
         bufferSize->setPlaceholderText(QString::fromUtf8(""));
 
         formLayout->setWidget(0, QFormLayout::ItemRole::FieldRole, bufferSize);
@@ -79,7 +74,7 @@ public:
 
         inputChannels = new QSpinBox(PwAsioDialog);
         inputChannels->setObjectName("inputChannels");
-        inputChannels->setMinimum(0);
+        inputChannels->setMinimum(1);
         inputChannels->setMaximum(64);
         inputChannels->setValue(16);
 
@@ -92,7 +87,7 @@ public:
 
         outputChannels = new QSpinBox(PwAsioDialog);
         outputChannels->setObjectName("outputChannels");
-        outputChannels->setMinimum(0);
+        outputChannels->setMinimum(1);
         outputChannels->setMaximum(64);
         outputChannels->setValue(16);
 
@@ -104,19 +99,9 @@ public:
         formLayout->setWidget(3, QFormLayout::ItemRole::LabelRole, label_7);
 
         sampleRate = new QComboBox(PwAsioDialog);
-        sampleRate->addItem(QString::fromUtf8("8000"));
-        sampleRate->addItem(QString::fromUtf8("11025"));
-        sampleRate->addItem(QString::fromUtf8("16000"));
-        sampleRate->addItem(QString::fromUtf8("22050"));
-        sampleRate->addItem(QString::fromUtf8("32000"));
-        sampleRate->addItem(QString::fromUtf8("44100"));
-        sampleRate->addItem(QString::fromUtf8("48000"));
-        sampleRate->addItem(QString::fromUtf8("88200"));
-        sampleRate->addItem(QString::fromUtf8("96000"));
-        sampleRate->addItem(QString::fromUtf8("176400"));
-        sampleRate->addItem(QString::fromUtf8("192000"));
         sampleRate->setObjectName("sampleRate");
-        sampleRate->setCurrentText(QString::fromUtf8("44100"));
+        sampleRate->setEditable(true);
+        sampleRate->setCurrentText(QString::fromUtf8("48000"));
 
         formLayout->setWidget(3, QFormLayout::ItemRole::FieldRole, sampleRate);
 
@@ -151,6 +136,7 @@ public:
         QObject::connect(inputChannels, SIGNAL(valueChanged(int)), PwAsioDialog, SLOT(inputChannelsChanged(int)));
         QObject::connect(outputChannels, SIGNAL(valueChanged(int)), PwAsioDialog, SLOT(outputChannelsChanged(int)));
         QObject::connect(sampleRate, SIGNAL(currentIndexChanged(QString)), PwAsioDialog, SLOT(sampleRateChanged(QString)));
+        QObject::connect(sampleRate, SIGNAL(editTextChanged(QString)), PwAsioDialog, SLOT(sampleRateChanged(QString)));
         QObject::connect(autoConnect, SIGNAL(toggled(bool)), PwAsioDialog, SLOT(autoConnectChanged(bool)));
 
         QMetaObject::connectSlotsByName(PwAsioDialog);
@@ -160,11 +146,9 @@ public:
     {
         PwAsioDialog->setWindowTitle(QCoreApplication::translate("PwAsioDialog", "PipeWire ASIO Settings", nullptr));
         label->setText(QCoreApplication::translate("PwAsioDialog", "Buffer size", nullptr));
-
         label_5->setText(QCoreApplication::translate("PwAsioDialog", "Input channels", nullptr));
         label_6->setText(QCoreApplication::translate("PwAsioDialog", "Output channels", nullptr));
         label_7->setText(QCoreApplication::translate("PwAsioDialog", "Sample rate", nullptr));
-
         label_8->setText(QCoreApplication::translate("PwAsioDialog", "Auto-connect", nullptr));
         autoConnect->setText(QCoreApplication::translate("PwAsioDialog", "Automatically connect to hardware", nullptr));
     } // retranslateUi

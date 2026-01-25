@@ -26,48 +26,24 @@
         </widget>
        </item>
        <item row="0" column="1">
-        <widget class="QComboBox" name="bufferSize">
-         <property name="focusPolicy">
-          <enum>Qt::StrongFocus</enum>
-         </property>
-         <property name="inputMethodHints">
-          <set>Qt::ImhDigitsOnly</set>
-         </property>
-         <property name="editable">
-          <bool>true</bool>
-         </property>
-         <property name="currentText">
-          <string notr="true">256</string>
-         </property>
-         <property name="placeholderText">
-          <string notr="true"/>
-         </property>
-         <item>
-          <property name="text">
-           <string notr="true">256</string>
+         <widget class="QComboBox" name="bufferSize">
+          <property name="focusPolicy">
+           <enum>Qt::StrongFocus</enum>
           </property>
-         </item>
-         <item>
-          <property name="text">
-           <string notr="true">384</string>
+          <property name="inputMethodHints">
+           <set>Qt::ImhDigitsOnly</set>
           </property>
-         </item>
-         <item>
-          <property name="text">
-           <string notr="true">512</string>
+          <property name="editable">
+           <bool>true</bool>
           </property>
-         </item>
-         <item>
-          <property name="text">
+          <property name="currentText">
            <string notr="true">1024</string>
           </property>
-         </item>
-         <item>
-          <property name="text">
-           <string notr="true">2024</string>
+          <property name="placeholderText">
+           <string notr="true"/>
           </property>
-         </item>
-        </widget>
+         </widget>
+
        </item>
        <item row="1" column="0">
         <widget class="QLabel" name="label_5">
@@ -76,11 +52,12 @@
          </property>
         </widget>
        </item>
-       <item row="1" column="1">
-        <widget class="QSpinBox" name="inputChannels">
-         <property name="minimum">
-          <number>0</number>
-         </property>
+        <item row="1" column="1">
+         <widget class="QSpinBox" name="inputChannels">
+          <property name="minimum">
+           <number>1</number>
+          </property>
+
          <property name="maximum">
           <number>64</number>
          </property>
@@ -96,11 +73,12 @@
          </property>
         </widget>
        </item>
-       <item row="2" column="1">
-        <widget class="QSpinBox" name="outputChannels">
-         <property name="minimum">
-          <number>0</number>
-         </property>
+        <item row="2" column="1">
+         <widget class="QSpinBox" name="outputChannels">
+          <property name="minimum">
+           <number>1</number>
+          </property>
+
          <property name="maximum">
           <number>64</number>
          </property>
@@ -116,68 +94,17 @@
          </property>
         </widget>
        </item>
-       <item row="3" column="1">
-        <widget class="QComboBox" name="sampleRate">
-         <property name="currentText">
-          <string notr="true">44100</string>
-         </property>
-         <item>
-          <property name="text">
-           <string notr="true">8000</string>
+        <item row="3" column="1">
+         <widget class="QComboBox" name="sampleRate">
+          <property name="editable">
+           <bool>true</bool>
           </property>
-         </item>
-         <item>
-          <property name="text">
-           <string notr="true">11025</string>
-          </property>
-         </item>
-         <item>
-          <property name="text">
-           <string notr="true">16000</string>
-          </property>
-         </item>
-         <item>
-          <property name="text">
-           <string notr="true">22050</string>
-          </property>
-         </item>
-         <item>
-          <property name="text">
-           <string notr="true">32000</string>
-          </property>
-         </item>
-         <item>
-          <property name="text">
-           <string notr="true">44100</string>
-          </property>
-         </item>
-         <item>
-          <property name="text">
+          <property name="currentText">
            <string notr="true">48000</string>
           </property>
-         </item>
-         <item>
-          <property name="text">
-           <string notr="true">88200</string>
-          </property>
-         </item>
-         <item>
-          <property name="text">
-           <string notr="true">96000</string>
-          </property>
-         </item>
-         <item>
-          <property name="text">
-           <string notr="true">176400</string>
-          </property>
-         </item>
-         <item>
-          <property name="text">
-           <string notr="true">192000</string>
-          </property>
-         </item>
-        </widget>
-       </item>
+         </widget>
+        </item>
+
        <item row="4" column="0">
         <widget class="QLabel" name="label_8">
          <property name="text">
@@ -295,6 +222,22 @@
    <connection>
     <sender>sampleRate</sender>
     <signal>currentIndexChanged(QString)</signal>
+    <receiver>PwAsioDialog</receiver>
+    <slot>sampleRateChanged(QString)</slot>
+    <hints>
+     <hint type="sourcelabel">
+      <x>300</x>
+      <y>210</y>
+     </hint>
+     <hint type="destinationlabel">
+      <x>187</x>
+      <y>138</y>
+     </hint>
+    </hints>
+   </connection>
+   <connection>
+    <sender>sampleRate</sender>
+    <signal>editTextChanged(QString)</signal>
     <receiver>PwAsioDialog</receiver>
     <slot>sampleRateChanged(QString)</slot>
     <hints>

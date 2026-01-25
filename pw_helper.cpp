@@ -32,10 +32,15 @@
 #include <fstream>
 #include <sstream>
 #include <string>
-#include <cstring>
 #include <algorithm>
 #include <cctype>
-#include <bit>
+
+// Debug logging macro - define PW_HELPER_DEBUG to enable verbose logging
+#ifdef PW_HELPER_DEBUG
+#define PW_DEBUG_PRINTF(...) printf(__VA_ARGS__)
+#else
+#define PW_DEBUG_PRINTF(...) ((void)0)
+#endif
 
 // Global worker callback for C/C++ bridge
 static pw_worker_callback_t g_worker_callback = nullptr;
@@ -74,10 +79,6 @@ struct SpaPod {
 		return SpaPod(spa_pod_copy(pod));
 	}
 
-	// Explicit static method to avoid copying by accident
-	static SpaPod copy(SpaPod const &from) {
-		return make(from.ptr);
-	}
 };
 
 // Source: <https://en.cppreference.com/w/cpp/container/unordered_map/find#Example>
@@ -231,27 +232,8 @@ struct Node final: Proxy {
 		}
 	}
 
-	#if 0
-	SpaPod get_or_wait_for_param(uint32_t id) {
-		// Wait for init
-		// TODO: Handle multi-step init
-		param_state.wait(ProxyState::Init, std::memory_order_relaxed);
-		// Then for updates
-		ProxyState state = ProxyState::PropsFilled;
-		while (!param_state.compare_exchange_weak(state, ProxyState::Fetching)) {
-			assert(state == ProxyState::UpdateInProgress);
-			param_state.wait(ProxyState::UpdateInProgress);
-		}
-
-		// Our turn to read
-		if (auto it = params.find(name); it != params.end())
-			SpaPod pod = SpaPod::copy();
-
-		param_state.store(ProxyState::PropsFilled, std::memory_order_release);
-		param_state.notify_one();
-		return pod;
-	}
-	#endif
+	// NOTE: get_or_wait_for_param() was removed - it was incomplete and used
+	// C++20 atomic wait features not available in C++17 mode
 
 	void update(struct pw_node_info const *new_info) {
 		// Simplified for C++17 compatibility
@@ -560,6 +542,7 @@ struct Helper {
 	std::atomic<InitState> init_state = InitState::Init;
 	std::atomic<int> roundtrip_state = -1;
 	std::mutex state_mutex;
+	std::condition_variable init_cv;
 
 	struct spa_hook roundtrip = {};
 
@@ -602,33 +585,30 @@ struct Helper {
 	}
 
 	void wait_for_roundtrip() {
-		// Simplified for C++17 compatibility - just check state
-		while (init_state.load(std::memory_order_relaxed) != InitState::Ready) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
-		}
+		std::unique_lock<std::mutex> lock(state_mutex);
+		init_cv.wait(lock, [this]() {
+			return init_state.load(std::memory_order_relaxed) == InitState::Ready;
+		});
 	}
 
 	void process_pending_operations() {
 		std::unique_lock<std::mutex> lock(worker_mutex);
-		printf("Worker: process_pending_operations called, pending_operation=%d\n", pending_operation);
+
 		if (pending_operation != PW_OP_NONE && operation_userdata) {
 			// Store operation info before calling the worker
 			enum pw_op_type current_op = pending_operation;
 			void *asio_driver = operation_userdata;
-			
+
 			// Reset operation state first
 			pending_operation = PW_OP_NONE;
 			operation_userdata = nullptr;
-			
+
 			// Unlock before invoking to avoid deadlocks
 			lock.unlock();
-			
+
 			// Execute the worker callback in the PipeWire thread loop context
 			int result = 0;
 			if (g_worker_callback) {
-				printf("Worker: Scheduling C worker callback for operation %d in PipeWire thread\n", current_op);
-				printf("Worker: thread_loop=%p, init_state=%d\n", thread_loop, (int)init_state.load());
-				
 				// Create a structure to pass data to the invoke callback
 				struct WorkerInvokeData {
 					pw_worker_callback_t callback;
@@ -641,22 +621,18 @@ struct Helper {
 					.operation = current_op,
 					.result = 0
 				};
-				
+
 				// Lock the PipeWire thread loop before calling pw_loop_invoke
-				printf("Worker: Locking PipeWire thread loop\n");
 				pw_thread_loop_lock(thread_loop);
-				
+
 				// Execute in PipeWire thread loop context
-				printf("Worker: Calling pw_loop_invoke\n");
 				pw_loop_invoke(pw_thread_loop_get_loop(thread_loop),
 					[](struct spa_loop *loop, bool async, uint32_t seq, const void *data, size_t size, void *user_data) -> int {
 						(void)loop; (void)async; (void)seq; (void)size; // Suppress unused parameter warnings
 						const WorkerInvokeData *invoke_data = static_cast<const WorkerInvokeData*>(data);
-						printf("Worker: Executing callback in PipeWire thread context\n");
 						// We need to modify the result, but data is const, so we use user_data
 						WorkerInvokeData *mutable_data = static_cast<WorkerInvokeData*>(user_data);
 						mutable_data->result = invoke_data->callback(invoke_data->userdata, invoke_data->operation);
-						printf("Worker: Callback completed with result %d\n", mutable_data->result);
 						return 0;
 					},
 					SPA_ID_INVALID, // No sequence number needed
@@ -664,29 +640,24 @@ struct Helper {
 					sizeof(invoke_data), // size parameter
 					true, // block until completion
 					&invoke_data); // user_data parameter
-				
-				printf("Worker: pw_loop_invoke completed\n");
-				
+
 				// Unlock the PipeWire thread loop
 				pw_thread_loop_unlock(thread_loop);
-				printf("Worker: Unlocked PipeWire thread loop\n");
-				
-				result = invoke_data.result;
-				if (result != 0) {
-					printf("Worker: C worker callback failed with error: %d\n", result);
-				} else {
-					printf("Worker: C worker callback completed successfully\n");
-				}
-			} else {
-				printf("Worker: No C worker callback registered for operation %d\n", current_op);
+
+			result = invoke_data.result;
+			if (result != 0) {
+				PWASIO_LOG_WARNING("Worker callback failed with error %d", result);
 			}
-			
+		} else {
+			PWASIO_LOG_WARNING("Worker callback not registered for operation %d", current_op);
+		}
+
+
 			// Notify waiting threads
 			worker_cond.notify_all();
-		} else {
-			printf("Worker: No pending operation to process\n");
 		}
 	}
+
 
 	// Add method to trigger event processing for filter state transitions
 	void trigger_event_processing() {
@@ -701,64 +672,31 @@ struct Helper {
 	// Add method to wait for filter state transitions with timeout
 	bool wait_for_filter_state_transition(struct pw_filter *filter, enum pw_filter_state target_state, int timeout_ms = 5000) {
 		if (!filter) return false;
-		
-		auto start_time = std::chrono::steady_clock::now();
-		auto timeout_duration = std::chrono::milliseconds(timeout_ms);
-		
-		printf("Waiting for filter state transition to %s (timeout: %d ms)\n", 
-		                 pw_filter_state_as_string(target_state), timeout_ms);
-		
-		int iteration = 0;
-		enum pw_filter_state last_state = PW_FILTER_STATE_ERROR;
-		
-		// Adaptive timing based on timeout duration - more aggressive for longer timeouts
-		bool is_long_timeout = timeout_ms > 10000;
-		int initial_fast_iterations = is_long_timeout ? 200 : 100;
-		int fast_delay_ms = is_long_timeout ? 2 : 5;
-		int slow_delay_ms = is_long_timeout ? 5 : 10;
-		
-		while (std::chrono::steady_clock::now() - start_time < timeout_duration) {
+
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+		int delay_ms = 1;
+		const int max_delay_ms = 50;
+
+		while (std::chrono::steady_clock::now() < deadline) {
 			enum pw_filter_state current_state = pw_filter_get_state(filter, nullptr);
-			
-			// Log state changes
-			if (current_state != last_state) {
-				printf("Filter state changed: %s -> %s (iteration %d)\n", 
-				                 pw_filter_state_as_string(last_state), 
-				                 pw_filter_state_as_string(current_state), iteration);
-				last_state = current_state;
-			}
-			
+
 			if (current_state == target_state) {
-				printf("Filter reached target state %s after %d iterations\n", 
-				                 pw_filter_state_as_string(target_state), iteration);
 				return true;
 			}
-			
+
 			if (current_state == PW_FILTER_STATE_ERROR) {
-				printf("Filter entered error state during state transition wait\n");
+				PWASIO_LOG_ERROR("Filter entered error state during state transition wait");
 				return false;
 			}
-			
-			// More aggressive event processing for faster state transitions
-			if (iteration < initial_fast_iterations) {
-				trigger_event_processing();
-				// Very short delay for initial iterations
-				std::this_thread::sleep_for(std::chrono::milliseconds(fast_delay_ms));
-			} else {
-				// Less frequent processing after initial period
-				if (iteration % 15 == 0) {
-					trigger_event_processing();
-				}
-				std::this_thread::sleep_for(std::chrono::milliseconds(slow_delay_ms));
-			}
-			
-			iteration++;
+
+			trigger_event_processing();
+
+			std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+			delay_ms = std::min(delay_ms * 2, max_delay_ms);
 		}
-		
-		enum pw_filter_state final_state = pw_filter_get_state(filter, nullptr);
-		printf("Filter state transition timeout after %d iterations. Final state: %s, target: %s\n", 
-		                 iteration, pw_filter_state_as_string(final_state), 
-		                 pw_filter_state_as_string(target_state));
+
+		PWASIO_LOG_WARNING("Filter state transition timeout waiting for %s",
+		                   pw_filter_state_as_string(target_state));
 		return false;
 	}
 
@@ -872,8 +810,11 @@ static void roundtrip_handler(void *data, uint32_t id, int seq) {
 		// This is to test whether the initialization code propely waits for the roundtrip.
 		std::this_thread::sleep_for(std::chrono::seconds(2));
 	}
-	This->init_state.store(InitState::Running, std::memory_order_relaxed);
-	// Removed notify_all for C++17 compatibility
+	{
+		std::lock_guard<std::mutex> lock(This->state_mutex);
+		This->init_state.store(InitState::Ready, std::memory_order_relaxed);
+	}
+	This->init_cv.notify_all();
 }
 
 static struct pw_core_events const s_core_events = {
@@ -941,19 +882,29 @@ Helper *create_helper(int argc, char **argv, InitArgs const *conf) {
 	// at a later point, but let's just wait now)
 	pw_core_add_listener(This->core, &This->roundtrip, &s_core_events, This.get());
 
-	This->init_state.store(InitState::Ready, std::memory_order_relaxed);
+	This->init_state.store(InitState::Init, std::memory_order_relaxed);
 
-	This->roundtrip_state.store(0, std::memory_order_relaxed);
-	pw_core_sync(This->core, PW_ID_CORE, 0);
-
-	std::puts("[DEBUG] Starting thread");
+	printf("PipeWine: Starting PipeWire thread loop\n");
 	if (pw_thread_loop_start(This->thread_loop)) {
 		std::fputs("Unable to start the PipeWire loop\n", stderr);
 		return nullptr;
 	}
 
+	/* Now that the loop is running, send the roundtrip sync */
+	printf("PipeWine: Thread loop started, sending roundtrip sync\n");
+	This->roundtrip_state.store(0, std::memory_order_relaxed);
+	pw_thread_loop_lock(This->thread_loop);
+	pw_core_sync(This->core, PW_ID_CORE, 0);
+	pw_thread_loop_unlock(This->thread_loop);
+
+	printf("PipeWine: Waiting for roundtrip completion...\n");
 	This->wait_for_roundtrip();
-	std::puts("[DEBUG] Rountrip done");
+	printf("PipeWine: Roundtrip completed, driver initialized!\n");
+	{
+		std::lock_guard<std::mutex> lock(This->state_mutex);
+		This->init_state.store(InitState::Running, std::memory_order_relaxed);
+	}
+	PW_DEBUG_PRINTF("Roundtrip complete\n");
 
 	if (conf->loop)
 		*conf->loop = pw_thread_loop_get_loop(This->thread_loop);
@@ -1030,6 +981,24 @@ struct pw_node *get_default_node(Helper *helper, enum spa_direction direction) {
 	return node;
 }
 
+struct pw_node *get_default_node_nonblocking(Helper *helper, enum spa_direction direction) {
+	struct pw_node *node = nullptr;
+	helper->lock();
+	if (helper->default_nodes) {
+		auto *nodes = helper->default_nodes.custom();
+		nodes->mutex.lock();
+		std::string_view name;
+		switch (direction) {
+			case SPA_DIRECTION_INPUT: name = nodes->default_source; break;
+			case SPA_DIRECTION_OUTPUT: name = nodes->default_sink; break;
+		}
+		node = find_node_by_name_locked(helper, name);
+		nodes->mutex.unlock();
+	}
+	helper->unlock();
+	return node;
+}
+
 struct pw_node *find_node_by_name(Helper *helper, char const *name) {
 	helper->lock();
 	struct pw_node *found = find_node_by_name_locked(helper, name);
@@ -1064,6 +1033,10 @@ void user_pw_destroy_helper(struct user_pw_helper *helper) {
 
 struct pw_node *user_pw_get_default_node(struct user_pw_helper *helper, enum spa_direction direction) {
 	return get_default_node(reinterpret_cast<Helper *>(helper), direction);
+}
+
+struct pw_node *user_pw_get_default_node_nonblocking(struct user_pw_helper *helper, enum spa_direction direction) {
+	return get_default_node_nonblocking(reinterpret_cast<Helper *>(helper), direction);
 }
 
 struct pw_node *user_pw_find_node_by_name(struct user_pw_helper *helper, char const *name) {

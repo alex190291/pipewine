@@ -10,7 +10,33 @@ ifeq ($(M),)
 $(error incorrect use of Makefile, M var is missing)
 endif
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Dependency version checks
+# ---------------------------------------------------------------------------------------------------------------------
+
+# Check for required PipeWire development files
+PIPEWIRE_VERSION := $(shell pkg-config --modversion libpipewire-0.3 2>/dev/null)
+ifeq ($(PIPEWIRE_VERSION),)
+$(error PipeWire development files not found. Install libpipewire-0.3-dev or pipewire-devel)
+endif
+
+# Check for Wine (optional but needed for testing)
+WINE_VERSION := $(shell wine --version 2>/dev/null | head -1)
+ifeq ($(WINE_VERSION),)
+$(warning Wine not found in PATH - build may succeed but testing will require Wine)
+endif
+
+# Print build configuration
+$(info Building PipeWireASIO for $(ARCH))
+$(info   PipeWire version: $(PIPEWIRE_VERSION))
+ifneq ($(WINE_VERSION),)
+$(info   Wine version: $(WINE_VERSION))
+endif
+
+# ---------------------------------------------------------------------------------------------------------------------
+
 export wineasio_dll_MODULE = pipewine$(M).dll
+export wineasio_dll_SPEC = pipewine$(M).dll.spec
 
 # Simplified GUI build
 libpwasio_gui:
@@ -76,7 +102,7 @@ wineasio_dll_C_SRCS   = asio.c \
 wineasio_dll_LDFLAGS  = -shared \
 			-m$(M) \
 			-mnocygwin \
-			wineasio.dll.spec \
+			$(wineasio_dll_SPEC) \
 			-L$(shell pkg-config --libs-only-L libpipewire-0.3 | sed 's/-L//g') \
 			-L/usr/lib$(M)/wine \
 			-L/usr/lib/$(ARCH)-linux-gnu/wine
@@ -118,9 +144,27 @@ build$(M)/%.c.o: %.c
 ### Target specific build rules
 
 build$(M)/$(wineasio_dll_MODULE): $(wineasio_dll_OBJS)
-	$(WINEBUILD) -m$(M) --dll --fake-module -E wineasio.dll.spec $^ -o $@
+	$(WINEBUILD) -m$(M) --dll --fake-module -N $(wineasio_dll_MODULE) -E $(wineasio_dll_SPEC) $^ -o $@
 
 build$(M)/$(wineasio_dll_MODULE).so: $(wineasio_dll_OBJS)
 	$(WINECXX) $^ $(wineasio_dll_LDFLAGS) $(LIBRARIES) \
 		$(wineasio_dll_DLLS:%=-l%) $(wineasio_dll_LIBRARIES:%=-l%) -o $@ \
 		-Wl,-soname,$(wineasio_dll_MODULE).so
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Development tools
+# ---------------------------------------------------------------------------------------------------------------------
+
+# Generate compile_commands.json for IDE support (clangd, etc.)
+compile_commands.json:
+	@echo "Generating compile_commands.json..."
+	@if command -v bear >/dev/null 2>&1; then \
+		bear -- $(MAKE) -B 64 2>/dev/null; \
+	elif command -v compiledb >/dev/null 2>&1; then \
+		compiledb make -B 64 2>/dev/null; \
+	else \
+		echo "Install 'bear' or 'compiledb' for compile_commands.json generation"; \
+		exit 1; \
+	fi
+
+.PHONY: compile_commands.json

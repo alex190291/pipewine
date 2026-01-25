@@ -44,6 +44,8 @@ struct pw_helper_init_args {
 	uint32_t buffer_size;
 	uint32_t num_input_channels;
 	uint32_t num_output_channels;
+	uint32_t num_midi_inputs;   // Number of MIDI input ports to create
+	uint32_t num_midi_outputs;  // Number of MIDI output ports to create
 	bool auto_connect;
 	bool exclusive_mode;
 	int rt_priority;
@@ -89,6 +91,13 @@ enum pw_asio_error {
 int pw_asio_load_config(struct pw_helper_init_args *args, const char *config_path);
 int pw_asio_save_config(const struct pw_helper_init_args *args, const char *config_path);
 void pw_asio_init_default_config(struct pw_helper_init_args *args);
+
+// Configuration path resolution
+// Returns allocated string with config path, caller must free
+// Priority: user config > system config > NULL
+char *pw_asio_get_config_path(void);
+// Get path for saving user config (creates directory if needed)
+char *pw_asio_get_user_config_path(void);
 
 // Utility functions
 const char *pw_asio_error_string(enum pw_asio_error error);

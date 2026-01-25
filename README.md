@@ -97,8 +97,9 @@ rt_priority = 10
 # Set PipeWire quantum to match buffer size
 pw-metadata -n settings 0 clock.quantum 512
 ```
+
 ## ✨ Known Issues:
-You need to disable your DAWs audio engine otherwise programs started after the DAW cant create Pipewire portals
+You need to disable your DAW's audio engine, otherwise programs started after the DAW can't create PipeWire portals.
 
 ## 🎵 Audio Applications
 
@@ -160,15 +161,6 @@ pw-metadata -n settings 0 clock.quantum 256
 
 # Configure matching buffer size in pipewine.conf
 echo "buffer_size = 512" >> ~/.config/pipewine/pipewine.conf
-```
-
-**Q: GUI not opening or has issues**
-```bash
-# Note: GUI currently has known issues and is under development
-# For now, use configuration file or registry settings instead
-
-# Ensure GUI library is installed (if attempting to use GUI)
-sudo cp build64/libpwasio_gui.so /usr/lib64/wine/x86_64-unix/
 ```
 
 ## 🤝 Contributing

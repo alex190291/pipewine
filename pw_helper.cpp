@@ -9,6 +9,11 @@
 #include <atomic>
 #include <mutex>
 #include <cassert>
+#include <charconv>
+#include <limits>
+#include <map>
+#include <pipewire/port.h>
+#include <pipewire/link.h>
 
 #include <thread>
 #include <unordered_map>
@@ -165,12 +170,15 @@ __always_inline PwInterface ProxyPtr<T>::type() const {
 	return ProxyPtr<struct Proxy>(*this).custom()->type;
 }
 
+static void refresh_audio_connections(Helper *helper);
+
 struct Node final: Proxy {
 	using ProxyType = struct pw_node;
 
 	std::atomic<ProxyState> info_state;
 	std::atomic<ProxyState> param_state;
 	struct spa_hook listener;
+	Helper *owner = nullptr;
 	struct pw_node_info info;
 	string_map properties;
 	std::unordered_map<uint32_t, SpaPod> params;
@@ -180,12 +188,12 @@ struct Node final: Proxy {
 	void init(ProxyPtr<Node> proxy) {
 		new (this) Node;
 		Proxy::type = PwInterface::Node;
+		info = {};
 		info_state.store(ProxyState::Init, std::memory_order_relaxed);
 		param_state.store(ProxyState::Init, std::memory_order_relaxed);
 		listener = {};
 		struct pw_node *raw_proxy = proxy;
 		pw_node_add_listener(raw_proxy, &listener, &s_events, raw_proxy);
-		pw_node_enum_params(raw_proxy, 0, PW_ID_ANY, 0, ~(uint32_t)0, nullptr);
 	}
 
 	// Bad name
@@ -238,18 +246,23 @@ struct Node final: Proxy {
 	void update(struct pw_node_info const *new_info) {
 		// Simplified for C++17 compatibility
 		info = *new_info;
-		properties.clear();
-		for (auto *it = info.props->items, *end = it + info.props->n_items; it != end; ++it) {
-			std::string key = it->key;
-			std::string value = it->value;
-			properties.emplace(std::move(key), std::move(value));
+		/* PipeWire owns info's dictionaries; only retain copied properties. */
+		info.props = nullptr;
+		info.params = nullptr;
+		info.n_params = 0;
+		if (new_info->props) {
+			for (uint32_t i = 0; i < new_info->props->n_items; ++i) {
+				auto &item = new_info->props->items[i];
+				if (item.key && item.value) properties.insert_or_assign(item.key, item.value);
+			}
 		}
 		info_state.store(ProxyState::PropsFilled, std::memory_order_release);
+		if (owner) refresh_audio_connections(owner);
 	}
 
 	void update_param(void *proxy, uint32_t id, uint32_t index, uint32_t next, struct spa_pod const *param) {
 		// Simplified for C++17 compatibility
-		SpaPod pod = SpaPod::make(param);
+		SpaPod pod = param ? SpaPod::make(param) : SpaPod{};
 		if (auto it = params.find(id); it != params.end()) {
 			it->second = std::move(pod);
 		} else {
@@ -322,15 +335,19 @@ struct MetadataHandler {
 	void (*destroy)(Metadata *self);
 };
 
-Metadata::~Metadata() {
-	if (vtable)
-		vtable->destroy(this);
-}
+Metadata::~Metadata() = default;
 
 static int meta_property_handler(void *proxy, uint32_t subject, char const *key, char const *type, char const *value) {
 	auto mproxy = ProxyPtr<Metadata>::from_bound(proxy);
 	Metadata *meta = mproxy.custom();
 	if (!meta->vtable) {
+		return 0;
+	}
+	/* Deletions have null type/value; a metadata-wide clear has null key. */
+	if (!key || !type || !value) {
+		// Dispatch removals through the generic callback.
+		if (meta->vtable->generic_prop)
+			meta->vtable->generic_prop(mproxy, subject, key, type, value);
 		return 0;
 	}
 	std::string_view svkey = key;
@@ -346,6 +363,7 @@ static int meta_property_handler(void *proxy, uint32_t subject, char const *key,
 		//std::printf("[DEBUG] Handling property '%s' of type '%s'\n", key, type);
 
 		MetadataProp *scratch = reinterpret_cast<MetadataProp *>(std::malloc(prop->proc_size));
+		if (!scratch) return -ENOMEM;
 		scratch->subject = subject;
 		scratch->key = key;
 		scratch->type = type;
@@ -420,7 +438,7 @@ static bool parse_json_dict(struct spa_json *parser, char *heap, size_t heap_siz
 			if (spa_json_is_container(token, l)) {
 				struct spa_json sub;
 				spa_json_enter(&obj, &sub);
-				while ((l = spa_json_next(&sub, &token) > 0)) {}
+				while ((l = spa_json_next(&sub, &token)) > 0) {}
 				if (l < 0)
 					return false;
 			}
@@ -435,6 +453,7 @@ static bool parse_json_dict(struct spa_json *parser, char *heap, size_t heap_siz
 }
 
 struct DefaultNodes: Metadata {
+	Helper *owner = nullptr;
 	std::mutex mutex;
 	std::string default_source;
 	std::string default_sink;
@@ -442,8 +461,8 @@ struct DefaultNodes: Metadata {
 	static MetadataHandler const s_handler;
 
 	void init(ProxyPtr<DefaultNodes> proxy) {
-		Metadata::init(proxy);
 		new (this) DefaultNodes;
+		Metadata::init(proxy);
 		Metadata::vtable = &s_handler;
 	}
 };
@@ -465,6 +484,7 @@ static MetaPropResult default_nodes_source_handler(ProxyPtr<Metadata> proxy, Met
 		nodes->mutex.lock();
 		nodes->default_source.assign(source);
 		nodes->mutex.unlock();
+		refresh_audio_connections(nodes->owner);
 		//std::printf("[DEBUG] Found default source: %s\n", source);
 	} else {
 		std::fputs("[DEBUG] Default source node not found in metadata\n", stderr);
@@ -485,6 +505,7 @@ static MetaPropResult default_nodes_sink_handler(ProxyPtr<Metadata> proxy, Metad
 		nodes->mutex.lock();
 		nodes->default_sink.assign(sink);
 		nodes->mutex.unlock();
+		refresh_audio_connections(nodes->owner);
 		//std::printf("[DEBUG] Found default sink: %s\n", sink);
 	} else {
 		std::fputs("[DEBUG] Default sink node not found in metadata\n", stderr);
@@ -520,8 +541,22 @@ static MetadataPropHandler const *const default_nodes_props[] = {
 MetadataHandler const DefaultNodes::s_handler = {
 	.properties = default_nodes_props,
 	.num_properties = std::size(default_nodes_props),
-	.generic_prop = nullptr,
+	.generic_prop = [] (ProxyPtr<Metadata> proxy, uint32_t subject, const char *key,
+	                    const char *type, const char *value) {
+		if (subject != PW_ID_CORE || value) return;
+		auto *nodes = proxy.to_derived<DefaultNodes>().custom();
+		std::lock_guard<std::mutex> lock(nodes->mutex);
+		if (!key || std::strcmp(key, "default.audio.source") == 0) nodes->default_source.clear();
+		if (!key || std::strcmp(key, "default.audio.sink") == 0) nodes->default_sink.clear();
+		refresh_audio_connections(nodes->owner);
+	},
 	.destroy = [] (Metadata *self) { static_cast<DefaultNodes *>(self)->~DefaultNodes(); },
+};
+
+struct AudioPort {
+	uint32_t node, index;
+	bool input;
+	std::string name;
 };
 
 struct Helper {
@@ -538,6 +573,11 @@ struct Helper {
 
 	std::unordered_map<uint32_t, ProxyPtr<Proxy>> bound_proxies;
 	ProxyPtr<DefaultNodes> default_nodes = {};
+	std::unordered_map<uint32_t, AudioPort> audio_ports;
+	std::map<std::pair<uint32_t, uint32_t>, struct pw_proxy *> audio_links;
+	uint32_t connection_node = SPA_ID_INVALID;
+	uint64_t connection_inputs = 0, connection_outputs = 0;
+	std::string connection_source, connection_sink;
 
 	std::atomic<InitState> init_state = InitState::Init;
 	std::atomic<int> roundtrip_state = -1;
@@ -545,6 +585,8 @@ struct Helper {
 	std::condition_variable init_cv;
 
 	struct spa_hook roundtrip = {};
+	bool loop_started = false;
+	bool init_failed = false;
 
 	// Device hot-plug callback (optional)
 	PwHelper::DeviceCallback device_cb;
@@ -557,6 +599,17 @@ struct Helper {
 	void *operation_userdata = nullptr;
 
 	~Helper() {
+		stop();
+		for (auto &[pair, link] : audio_links) pw_proxy_destroy(link);
+		for (auto &[id, proxy] : bound_proxies) {
+			if (proxy.type() == PwInterface::Node) proxy.to_derived<Node>().custom()->~Node();
+			else if (proxy.type() == PwInterface::Metadata) {
+				auto *meta = proxy.to_derived<Metadata>().custom();
+				meta->vtable->destroy(meta);
+			}
+			pw_proxy_destroy(proxy);
+		}
+		bound_proxies.clear();
 		if (core) {
 			pw_core_disconnect(core);
 		}
@@ -569,26 +622,20 @@ struct Helper {
 	}
 
 	void stop() {
-		pw_thread_loop_stop(this->thread_loop);
-	}
-
-	void lock() {
-		if (init_state.load(std::memory_order_relaxed) == InitState::Running) {
-			state_mutex.lock();
+		if (loop_started) {
+			pw_thread_loop_stop(thread_loop);
+			loop_started = false;
 		}
 	}
 
-	void unlock() {
-		if (init_state.load(std::memory_order_relaxed) == InitState::Running) {
-			state_mutex.unlock();
-		}
-	}
+	void lock() { pw_thread_loop_lock(thread_loop); }
+	void unlock() { pw_thread_loop_unlock(thread_loop); }
 
-	void wait_for_roundtrip() {
+	bool wait_for_roundtrip() {
 		std::unique_lock<std::mutex> lock(state_mutex);
-		init_cv.wait(lock, [this]() {
-			return init_state.load(std::memory_order_relaxed) == InitState::Ready;
-		});
+		return init_cv.wait_for(lock, std::chrono::seconds(5), [this]() {
+			return init_failed || init_state.load() == InitState::Ready;
+		}) && !init_failed;
 	}
 
 	void process_pending_operations() {
@@ -678,7 +725,9 @@ struct Helper {
 		const int max_delay_ms = 50;
 
 		while (std::chrono::steady_clock::now() < deadline) {
+			pw_thread_loop_lock(thread_loop);
 			enum pw_filter_state current_state = pw_filter_get_state(filter, nullptr);
+			pw_thread_loop_unlock(thread_loop);
 
 			if (current_state == target_state) {
 				return true;
@@ -688,8 +737,6 @@ struct Helper {
 				PWASIO_LOG_ERROR("Filter entered error state during state transition wait");
 				return false;
 			}
-
-			trigger_event_processing();
 
 			std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
 			delay_ms = std::min(delay_ms * 2, max_delay_ms);
@@ -708,6 +755,76 @@ struct Helper {
 		return PwInterface::Unknown;
 	}
 };
+
+/* Runs only under the PipeWire main-loop lock, never in audio processing. */
+static void refresh_audio_connections(Helper *helper) {
+    if (!helper || helper->connection_node == SPA_ID_INVALID) return;
+    std::string source = helper->connection_source, sink = helper->connection_sink;
+    if (helper->default_nodes) {
+        auto *defaults = helper->default_nodes.custom();
+        if (source.empty()) source = defaults->default_source;
+        if (sink.empty()) sink = defaults->default_sink;
+    }
+    auto node_id = [&](const std::string &name) -> uint32_t {
+        if (name.empty()) return SPA_ID_INVALID;
+        for (auto &[id, proxy] : helper->bound_proxies) {
+            if (proxy.type() != PwInterface::Node) continue;
+            const auto &props = proxy.to_derived<Node>().custom()->properties;
+            auto it = props.find(PW_KEY_NODE_NAME);
+            if (it != props.end() && it->second == name) return id;
+        }
+        return SPA_ID_INVALID;
+    };
+    uint32_t source_id = node_id(source), sink_id = node_id(sink);
+    PW_DEBUG_PRINTF("connections: source=%s(%u) sink=%s(%u) filter=%u ports=%zu\n",
+                    source.c_str(), source_id, sink.c_str(), sink_id, helper->connection_node, helper->audio_ports.size());
+    using PortPair = std::pair<uint32_t, uint32_t>; // global output/input port IDs
+    std::vector<PortPair> desired;
+    auto connect_direction = [&](uint32_t target, bool capture, uint64_t mask) {
+        if (target == SPA_ID_INVALID || target == helper->connection_node || !mask) return;
+        std::vector<std::pair<uint32_t, const AudioPort *>> local, remote;
+        for (auto &[id, port] : helper->audio_ports) {
+            if (port.node == target && port.input != capture) remote.emplace_back(id, &port);
+            if (port.node != helper->connection_node || port.input != capture) continue;
+            const char *prefix = capture ? "input_" : "output_";
+            if (port.name.compare(0, std::strlen(prefix), prefix) != 0) continue;
+            uint32_t channel = 0;
+            auto number = std::string_view(port.name).substr(std::strlen(prefix));
+            auto parsed = std::from_chars(number.data(), number.data() + number.size(), channel);
+            if (parsed.ec == std::errc{} && parsed.ptr == number.data() + number.size() &&
+                channel < 64 && (mask & (uint64_t{1} << channel))) local.emplace_back(id, &port);
+        }
+        PW_DEBUG_PRINTF("direction capture=%d mask=%llu local=%zu remote=%zu\n", capture,
+                        (unsigned long long)mask, local.size(), remote.size());
+        auto sort_ports = [](const auto &a, const auto &b) { return a.second->index < b.second->index; };
+        std::sort(local.begin(), local.end(), sort_ports);
+        std::sort(remote.begin(), remote.end(), sort_ports);
+        for (size_t i = 0; i < std::min(local.size(), remote.size()); ++i)
+            desired.emplace_back(capture ? remote[i].first : local[i].first,
+                                 capture ? local[i].first : remote[i].first);
+    };
+    connect_direction(source_id, true, helper->connection_inputs);
+    connect_direction(sink_id, false, helper->connection_outputs);
+    for (auto it = helper->audio_links.begin(); it != helper->audio_links.end();) {
+        if (std::find(desired.begin(), desired.end(), it->first) == desired.end()) {
+            pw_proxy_destroy(it->second);
+            it = helper->audio_links.erase(it);
+        } else ++it;
+    }
+    for (auto pair : desired) {
+        if (helper->audio_links.count(pair)) continue;
+        std::string output = std::to_string(pair.first), input = std::to_string(pair.second);
+        const struct spa_dict_item items[] = {
+            {PW_KEY_LINK_OUTPUT_PORT, output.c_str()}, {PW_KEY_LINK_INPUT_PORT, input.c_str()},
+            {PW_KEY_OBJECT_LINGER, "false"},
+        };
+        const struct spa_dict props = SPA_DICT_INIT(items, 3);
+        auto *proxy = static_cast<struct pw_proxy *>(pw_core_create_object(helper->core,
+            "link-factory", PW_TYPE_INTERFACE_Link, PW_VERSION_LINK, &props, 0));
+        PW_DEBUG_PRINTF("create link output=%u input=%u proxy=%p\n", pair.first, pair.second, (void *)proxy);
+        if (proxy) helper->audio_links.emplace(pair, proxy);
+    }
+}
 
 #include "pw_thread.inc.cpp"
 
@@ -733,12 +850,30 @@ static void registry_global_handler(
 	Helper *This = reinterpret_cast<Helper *>(data);
 	PwHelper::DeviceCallback cb;
 	struct pw_node *added_node = nullptr;
+	if (std::strcmp(type, PW_TYPE_INTERFACE_Port) == 0 && props) {
+		const char *node = spa_dict_lookup(props, PW_KEY_NODE_ID);
+		const char *index = spa_dict_lookup(props, PW_KEY_PORT_ID);
+		const char *direction = spa_dict_lookup(props, PW_KEY_PORT_DIRECTION);
+		const char *name = spa_dict_lookup(props, PW_KEY_PORT_NAME);
+		const char *format = spa_dict_lookup(props, PW_KEY_FORMAT_DSP);
+		PW_DEBUG_PRINTF("port %u: node=%s index=%s direction=%s name=%s format=%s\n", id,
+		                node ? node : "", index ? index : "", direction ? direction : "", name ? name : "", format ? format : "");
+		if (node && index && direction && name && format &&
+		    std::strcmp(format, "32 bit float mono audio") == 0) {
+			This->audio_ports.emplace(id, AudioPort{static_cast<uint32_t>(std::strtoul(node, nullptr, 10)),
+			    static_cast<uint32_t>(std::strtoul(index, nullptr, 10)), std::strcmp(direction, "in") == 0, name});
+			refresh_audio_connections(This);
+		}
+		return;
+	}
 	switch (get_known_interface(type)) {
 		case PwInterface::Node: {
 			This->lock();
 			auto proxy = ProxyPtr<Node>::from_bound(
 				pw_registry_bind(This->registry, id, type, std::min(version, (uint32_t)PW_VERSION_NODE), sizeof(Node)));
+			if (!proxy.proxy) { This->unlock(); break; }
 			proxy.custom()->init(proxy);
+			proxy.custom()->owner = This;
 			This->bound_proxies.emplace(id, proxy);
 			cb = This->device_cb;
 			added_node = proxy;
@@ -746,11 +881,14 @@ static void registry_global_handler(
 			break;
 		}
 		case PwInterface::Metadata: {
-			if ("default"sv == spa_dict_lookup(props, PW_KEY_METADATA_NAME)) {
+			const char *metadata_name = props ? spa_dict_lookup(props, PW_KEY_METADATA_NAME) : nullptr;
+			if (metadata_name && "default"sv == metadata_name) {
 				This->lock();
 				auto proxy = ProxyPtr<DefaultNodes>::from_bound(
 					pw_registry_bind(This->registry, id, type, std::min(version, (uint32_t)PW_VERSION_METADATA), sizeof(DefaultNodes)));
+				if (!proxy.proxy) { This->unlock(); break; }
 				proxy.custom()->init(proxy);
+				proxy.custom()->owner = This;
 				This->bound_proxies.emplace(id, proxy);
 				if (This->default_nodes) {
 					std::puts("New default nodes object? Overriding old one.");
@@ -773,6 +911,7 @@ static void registry_global_remove_handler(void *data, uint32_t id) {
 	PwHelper::DeviceCallback cb;
 	struct pw_node *removed_node = nullptr;
 	This->lock();
+	This->audio_ports.erase(id);
 	switch (This->get_proxy(id, global)) {
 		case PwInterface::Node:
 			removed_node = global.to_derived<Node>();
@@ -782,7 +921,7 @@ static void registry_global_remove_handler(void *data, uint32_t id) {
 			if (This->default_nodes == global) {
 				This->default_nodes = nullptr;
 			}
-			global.to_derived<Metadata>().custom()->~Metadata();
+			global.to_derived<Metadata>().custom()->vtable->destroy(global.to_derived<Metadata>().custom());
 			goto destroy_proxy;
 
 		destroy_proxy:
@@ -792,6 +931,7 @@ static void registry_global_remove_handler(void *data, uint32_t id) {
 			break;
 		case PwInterface::Unknown: break;
 	}
+	refresh_audio_connections(This);
 	This->unlock();
 	if (cb && removed_node) {
 		cb(removed_node, false);
@@ -806,20 +946,29 @@ static struct pw_registry_events const s_registry_events = {
 
 static void roundtrip_handler(void *data, uint32_t id, int seq) {
 	Helper *This = reinterpret_cast<Helper *>(data);
-	if (false) {
-		// This is to test whether the initialization code propely waits for the roundtrip.
-		std::this_thread::sleep_for(std::chrono::seconds(2));
+	std::lock_guard<std::mutex> lock(This->state_mutex);
+	if (id == PW_ID_CORE && seq == This->roundtrip_state.load() &&
+	    This->init_state.load() == InitState::Init) {
+		This->init_state.store(InitState::Ready);
+		This->init_cv.notify_all();
 	}
-	{
-		std::lock_guard<std::mutex> lock(This->state_mutex);
-		This->init_state.store(InitState::Ready, std::memory_order_relaxed);
+}
+
+static void core_error_handler(void *data, uint32_t id, int seq, int res, const char *message) {
+	Helper *This = reinterpret_cast<Helper *>(data);
+	if (id != PW_ID_CORE) {
+		PWASIO_LOG_WARNING("PipeWire object %u: %s (%d)", id, message ? message : "error", res);
+		return;
 	}
+	std::lock_guard<std::mutex> lock(This->state_mutex);
+	This->init_failed = true;
 	This->init_cv.notify_all();
 }
 
 static struct pw_core_events const s_core_events = {
 	.version = PW_VERSION_CORE_EVENTS,
 	.done = roundtrip_handler,
+	.error = core_error_handler,
 };
 
 Helper *create_helper(int argc, char **argv, InitArgs const *conf) {
@@ -892,13 +1041,16 @@ Helper *create_helper(int argc, char **argv, InitArgs const *conf) {
 
 	/* Now that the loop is running, send the roundtrip sync */
 	printf("PipeWine: Thread loop started, sending roundtrip sync\n");
-	This->roundtrip_state.store(0, std::memory_order_relaxed);
+	This->loop_started = true;
 	pw_thread_loop_lock(This->thread_loop);
-	pw_core_sync(This->core, PW_ID_CORE, 0);
+	This->roundtrip_state.store(pw_core_sync(This->core, PW_ID_CORE, 0));
 	pw_thread_loop_unlock(This->thread_loop);
 
 	printf("PipeWine: Waiting for roundtrip completion...\n");
-	This->wait_for_roundtrip();
+	if (!This->wait_for_roundtrip()) {
+		std::fputs("PipeWire initialization timed out or connection failed\n", stderr);
+		return nullptr;
+	}
 	printf("PipeWine: Roundtrip completed, driver initialized!\n");
 	{
 		std::lock_guard<std::mutex> lock(This->state_mutex);
@@ -917,7 +1069,6 @@ Helper *create_helper(int argc, char **argv, InitArgs const *conf) {
 }
 
 void destroy_helper(Helper *helper) {
-	helper->stop();
 	delete helper;
 }
 
@@ -941,6 +1092,7 @@ static struct pw_node *find_node_by_name_locked(Helper *helper, std::string_view
 	struct pw_node *found = nullptr;
 	for (auto it = helper->bound_proxies.begin(), end = helper->bound_proxies.end(); it != end; ++it) {
 		if (it->second.type() == PwInterface::Node) {
+			nod_name.clear();
 			it->second.to_derived<Node>().custom()->get_or_wait_for_info(nullptr, nullptr, props);
 			if (nod_name == name) {
 				found = it->second.to_derived<Node>();
@@ -951,34 +1103,10 @@ static struct pw_node *find_node_by_name_locked(Helper *helper, std::string_view
 	return found;
 }
 
-static void wait_for_nodes_init(Helper *helper, std::mutex &mutex) {
-	retry:
-	for (auto it = helper->bound_proxies.begin(), end = helper->bound_proxies.end(); it != end; ++it) {
-		if (it->second.type() == PwInterface::Node) {
-			if (!it->second.to_derived<Node>().custom()->inited(mutex)) {
-				goto retry;
-			}
-		}
-	}
-}
-
 struct pw_node *get_default_node(Helper *helper, enum spa_direction direction) {
-	struct pw_node *node = nullptr;
-	helper->lock();
-	if (helper->default_nodes) {
-		auto *nodes = helper->default_nodes.custom();
-		nodes->mutex.lock();
-		wait_for_nodes_init(helper, nodes->mutex);
-		std::string_view name;
-		switch (direction) {
-			case SPA_DIRECTION_INPUT: name = nodes->default_source; break;
-			case SPA_DIRECTION_OUTPUT: name = nodes->default_sink; break;
-		}
-		node = find_node_by_name_locked(helper, name);
-		nodes->mutex.unlock();
-	}
-	helper->unlock();
-	return node;
+	/* Registry info arrives asynchronously. Never spin while holding locks
+	 * that prevent the loop from delivering that info. */
+	return get_default_node_nonblocking(helper, direction);
 }
 
 struct pw_node *get_default_node_nonblocking(Helper *helper, enum spa_direction direction) {
@@ -1007,8 +1135,14 @@ struct pw_node *find_node_by_name(Helper *helper, char const *name) {
 }
 
 void get_node_props(Helper *helper, struct pw_node *proxy, std::vector<std::pair<std::string_view, std::string*> > const& props) {
-	Node *node = ProxyPtr<Node>(proxy).custom();
-	node->get_or_wait_for_info(nullptr, nullptr, props);
+	helper->lock();
+	for (auto &[id, bound] : helper->bound_proxies) {
+		if (bound.type() == PwInterface::Node && bound == ProxyPtr<Node>(proxy)) {
+			bound.to_derived<Node>().custom()->get_or_wait_for_info(nullptr, nullptr, props);
+			break;
+		}
+	}
+	helper->unlock();
 }
 
 void lock_loop(Helper *helper) {
@@ -1079,6 +1213,24 @@ struct pw_node **user_pw_enumerate_endpoints(struct user_pw_helper *helper, int 
 	return result;
 }
 
+void user_pw_configure_audio_connections(struct user_pw_helper *helper, uint32_t node,
+                                        const char *source, const char *sink,
+                                        uint64_t inputs, uint64_t outputs) {
+	auto *h = reinterpret_cast<Helper *>(helper);
+	if (!h) return;
+	h->lock();
+	h->connection_node = node;
+	h->connection_source = source ? source : "";
+	h->connection_sink = sink ? sink : "";
+	h->connection_inputs = inputs;
+	h->connection_outputs = outputs;
+	if (node == SPA_ID_INVALID) {
+		for (auto &[pair, link] : h->audio_links) pw_proxy_destroy(link);
+		h->audio_links.clear();
+	} else refresh_audio_connections(h);
+	h->unlock();
+}
+
 void user_pw_free_endpoints(struct pw_node **endpoints) {
 	if (endpoints) {
 		free(endpoints);
@@ -1087,11 +1239,18 @@ void user_pw_free_endpoints(struct pw_node **endpoints) {
 
 // Helper functions for configuration parsing
 static std::string trim(const std::string &s) {
-	auto start = s.begin();
-	while (start != s.end() && std::isspace(*start)) ++start;
-	auto end = s.end();
-	do { --end; } while (std::distance(start, end) > 0 && std::isspace(*end));
-	return std::string(start, end + 1);
+	auto first = s.find_first_not_of(" \t\r\n");
+	if (first == std::string::npos) return {};
+	return s.substr(first, s.find_last_not_of(" \t\r\n") - first + 1);
+}
+
+static bool parse_uint(const std::string &value, uint32_t &out) {
+	if (value.empty()) return false;
+	uint32_t parsed;
+	auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+	if (result.ec != std::errc{} || result.ptr != value.data() + value.size()) return false;
+	out = parsed;
+	return true;
 }
 
 static bool parse_bool(const std::string &val, bool def) {
@@ -1107,17 +1266,14 @@ static bool parse_bool(const std::string &val, bool def) {
 // -----------------------------------------------------------------------------
 
 static uint32_t env_to_uint(const char *val, uint32_t def_val) {
-	if (!val || !*val) return def_val;
-	char *end = nullptr;
-	unsigned long v = std::strtoul(val, &end, 10);
-	if (end && *end) return def_val; // invalid numeric
-	return (uint32_t)v;
+	uint32_t parsed;
+	return val && parse_uint(val, parsed) ? parsed : def_val;
 }
 
 static bool env_to_bool(const char *val, bool def_val) {
 	if (!val || !*val) return def_val;
 	std::string s(val);
-	std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+	std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
 	return parse_bool(s, def_val);
 }
 
@@ -1151,75 +1307,89 @@ void pw_asio_apply_env_overrides(struct pw_helper_init_args *args) {
 	v = std::getenv("PIPEWIREASIO_EXCLUSIVE_MODE");
 	args->exclusive_mode = env_to_bool(v, args->exclusive_mode);
 
-	// String valued env vars need to persist
-	static std::string in_dev, out_dev, client_name;
-
+	// getenv storage remains valid until the environment is changed. Avoid
+	// nontrivial TLS destructors: they prevent Wine's ELF DLL from unloading.
 	v = std::getenv("PIPEWIREASIO_INPUT_DEVICE");
-	if (v && *v) { in_dev = v; args->input_device_name = in_dev.c_str(); }
-
+	if (v && *v) args->input_device_name = v;
 	v = std::getenv("PIPEWIREASIO_OUTPUT_DEVICE");
-	if (v && *v) { out_dev = v; args->output_device_name = out_dev.c_str(); }
-
+	if (v && *v) args->output_device_name = v;
 	v = std::getenv("PIPEWIREASIO_CLIENT_NAME");
-	if (v && *v) { client_name = v; args->client_name = client_name.c_str(); }
+	if (v && *v) args->client_name = v;
 }
 
 int pw_asio_load_config(struct pw_helper_init_args *args, const char *config_path) {
-	if (!args || !config_path) return -1;
-	pw_asio_init_default_config(args);
-	std::ifstream f(config_path);
-	if (!f.is_open()) return -2;
-	std::string line, section;
-	while (std::getline(f, line)) {
-		line = trim(line);
-		if (line.empty() || line[0] == '#') continue;
-		if (line.front() == '[' && line.back() == ']') {
-			section = line.substr(1, line.size() - 2);
-			std::transform(section.begin(), section.end(), section.begin(), ::tolower);
-			continue;
-		}
-		auto eq = line.find('=');
-		if (eq == std::string::npos) continue;
-		std::string key = trim(line.substr(0, eq));
-		std::string val = trim(line.substr(eq + 1));
-		std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-		if (section == "audio") {
-			if (key == "sample_rate") args->sample_rate = std::stoi(val);
-			else if (key == "buffer_size") args->buffer_size = std::stoi(val);
-			else if (key == "input_channels") args->num_input_channels = std::stoi(val);
-			else if (key == "output_channels") args->num_output_channels = std::stoi(val);
-		} else if (section == "devices") {
-			if (key == "input_device") {
-				static std::string in_dev; in_dev = val; args->input_device_name = in_dev.c_str();
-			} else if (key == "output_device") {
-				static std::string out_dev; out_dev = val; args->output_device_name = out_dev.c_str();
-			} else if (key == "auto_connect") args->auto_connect = parse_bool(val, true);
-		} else if (section == "performance") {
-			if (key == "rt_priority") args->rt_priority = std::stoi(val);
-			else if (key == "exclusive_mode") args->exclusive_mode = parse_bool(val, false);
-		} else if (section == "advanced") {
-			if (key == "client_name") {
-				static std::string cname; cname = val; args->client_name = cname.c_str();
-			} else if (key == "debug_logging") {
-				// Not used in args, but could be handled here if needed
-			}
-		}
-	}
-
-	// Apply environment variable overrides (env takes precedence)
-	pw_asio_apply_env_overrides(args);
-
-	if (!pw_asio_is_valid_sample_rate(args->sample_rate)) {
-		return -PW_ASIO_ERROR_INVALID_PARAMETER;
-	}
-	if (!pw_asio_is_valid_buffer_size(args->buffer_size)) {
-		return -PW_ASIO_ERROR_BUFFER_SIZE_INVALID;
-	}
-	if (args->num_input_channels == 0 && args->num_output_channels == 0) {
-		return -PW_ASIO_ERROR_INVALID_PARAMETER;
-	}
-
-	return 0;
+    if (!args || !config_path) return -PW_ASIO_ERROR_INVALID_PARAMETER;
+    std::ifstream f(config_path);
+    if (!f.is_open()) return -PW_ASIO_ERROR_INIT_FAILED;
+    pw_helper_init_args parsed;
+    pw_asio_init_default_config(&parsed);
+    std::string line, section, input_device, output_device, client_name;
+    while (std::getline(f, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+        if (line.front() == '[' && line.back() == ']') {
+            section = trim(line.substr(1, line.size() - 2));
+            std::transform(section.begin(), section.end(), section.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            continue;
+        }
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = trim(line.substr(0, eq));
+        std::string val = trim(line.substr(eq + 1));
+        std::transform(key.begin(), key.end(), key.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        uint32_t *numeric = nullptr;
+        if (section == "audio") {
+            if (key == "sample_rate") numeric = &parsed.sample_rate;
+            else if (key == "buffer_size") numeric = &parsed.buffer_size;
+            else if (key == "input_channels") numeric = &parsed.num_input_channels;
+            else if (key == "output_channels") numeric = &parsed.num_output_channels;
+        } else if (section == "devices") {
+            if (key == "input_device") input_device = val;
+            else if (key == "output_device") output_device = val;
+            else if (key == "auto_connect") parsed.auto_connect = parse_bool(val, true);
+        } else if (section == "performance") {
+            if (key == "rt_priority") {
+                uint32_t priority;
+                if (!parse_uint(val, priority) || priority > 99)
+                    return -PW_ASIO_ERROR_INVALID_PARAMETER;
+                parsed.rt_priority = static_cast<int>(priority);
+            } else if (key == "exclusive_mode") parsed.exclusive_mode = parse_bool(val, false);
+        } else if (section == "advanced") {
+            if (key == "client_name") client_name = val;
+            else if (key == "debug_logging") parsed.debug_logging = parse_bool(val, false);
+            else if (key == "log_level") {
+                uint32_t level;
+                if (!parse_uint(val, level) || level > PW_ASIO_LOG_TRACE)
+                    return -PW_ASIO_ERROR_INVALID_PARAMETER;
+                parsed.log_level = static_cast<int>(level);
+            }
+        }
+        if (numeric && !parse_uint(val, *numeric)) return -PW_ASIO_ERROR_INVALID_PARAMETER;
+    }
+    if (f.bad()) return -PW_ASIO_ERROR_INIT_FAILED;
+    // Trivial TLS keeps borrowed strings independent between callers without
+    // registering destructors that prevent dlclose/COM reload of the Wine DLL.
+    static thread_local struct {
+        char input[4096], output[4096], client[4096];
+    } saved;
+    if (input_device.size() >= sizeof(saved.input) || output_device.size() >= sizeof(saved.output) ||
+        client_name.size() >= sizeof(saved.client)) return -PW_ASIO_ERROR_INVALID_PARAMETER;
+    std::memcpy(saved.input, input_device.c_str(), input_device.size() + 1);
+    std::memcpy(saved.output, output_device.c_str(), output_device.size() + 1);
+    std::memcpy(saved.client, client_name.c_str(), client_name.size() + 1);
+    parsed.input_device_name = saved.input;
+    parsed.output_device_name = saved.output;
+    parsed.client_name = saved.client;
+    pw_asio_apply_env_overrides(&parsed);
+    if (!pw_asio_is_valid_sample_rate(parsed.sample_rate)) return -PW_ASIO_ERROR_INVALID_PARAMETER;
+    if (!pw_asio_is_valid_buffer_size(parsed.buffer_size)) return -PW_ASIO_ERROR_BUFFER_SIZE_INVALID;
+    if (parsed.num_input_channels < 1 || parsed.num_input_channels > 64 ||
+        parsed.num_output_channels < 1 || parsed.num_output_channels > 64 ||
+        parsed.rt_priority < 0 || parsed.rt_priority > 99) return -PW_ASIO_ERROR_INVALID_PARAMETER;
+    *args = parsed;
+    return 0;
 }
 
 int pw_asio_save_config(const struct pw_helper_init_args *args, const char *config_path) {

@@ -39,16 +39,16 @@ export wineasio_dll_MODULE = pipewine$(M).dll
 export wineasio_dll_SPEC = pipewine$(M).dll.spec
 
 # Simplified GUI build
-libpwasio_gui:
+libpwasio_gui: build$(M)/pw_helper.o build$(M)/pw_config_utils.o
 	$(MAKE) -C gui ../build$(M)/libpwasio_gui.so
 
-build$(M)/pw_helper.o: pw_helper.cpp
+build$(M)/pw_helper.o: pw_helper.cpp pw_thread.inc.cpp
 	@$(shell mkdir -p build$(M))
-	$(WINECXX) -c $(INCLUDE_PATH) $(CFLAGS) $(CEXTRA) -std=c++20 -o $@ $<
+	$(WINECXX) -c $(INCLUDE_PATH) $(CFLAGS) $(filter-out -std=gnu11 -Wdeclaration-after-statement -Werror=implicit-function-declaration,$(CEXTRA)) -std=c++20 -fno-gnu-unique -MMD -MP -o $@ $<
 
 build$(M)/pw_config_utils.o: pw_config_utils.c
 	@$(shell mkdir -p build$(M))
-	$(CC) -c $(INCLUDE_PATH) $(CFLAGS) $(CEXTRA) -o $@ $<
+	$(CC) -c $(INCLUDE_PATH) $(CFLAGS) $(CEXTRA) -MMD -MP -o $@ $<
 
 PREFIX                = /usr
 SRCDIR                = .
@@ -66,7 +66,7 @@ endif
 
 ### Streamlined settings focused on PipeWire
 CEXTRA                = -m$(M) -D_REENTRANT -fPIC -Wall -pipe -std=gnu11 -D_GNU_SOURCE
-CEXTRA               += -fno-strict-aliasing -Wdeclaration-after-statement -Wwrite-strings -Wpointer-arith
+CEXTRA               += -fno-strict-aliasing -Wwrite-strings -Wpointer-arith
 CEXTRA               += -Werror=implicit-function-declaration
 CEXTRA               += $(shell pkg-config --cflags libpipewire-0.3)
 CEXTRA               += '-DDRIVER_DLL="$(wineasio_dll_MODULE)"'
@@ -103,7 +103,6 @@ wineasio_dll_LDFLAGS  = -shared \
 			-m$(M) \
 			-mnocygwin \
 			$(wineasio_dll_SPEC) \
-			-L$(shell pkg-config --libs-only-L libpipewire-0.3 | sed 's/-L//g') \
 			-L/usr/lib$(M)/wine \
 			-L/usr/lib/$(ARCH)-linux-gnu/wine
 
@@ -139,7 +138,7 @@ register:
 
 build$(M)/%.c.o: %.c
 	@$(shell mkdir -p build$(M))
-	$(CC) -c $(INCLUDE_PATH) $(CFLAGS) $(CEXTRA) -o $@ $<
+	$(CC) -c $(INCLUDE_PATH) $(CFLAGS) $(CEXTRA) -MMD -MP -o $@ $<
 
 ### Target specific build rules
 
@@ -168,3 +167,5 @@ compile_commands.json:
 	fi
 
 .PHONY: compile_commands.json
+
+-include $(wineasio_dll_OBJS:.o=.d)

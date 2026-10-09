@@ -1,84 +1,28 @@
-# PipeWire Quantum Synchronization Guide
+# PipeWire quantum and ASIO buffers
 
-## The Problem
+An ASIO host uses a fixed frame count until it disposes its buffers. PipeWine
+honors its requested power-of-two size between 16 and 8192 frames, unless fixed
+buffer mode is enabled. Fixed mode rejects requests that differ from its size.
 
-When using ASIO drivers with PipeWire, timing errors and callback issues can occur when the PipeWire quantum (buffer size) doesn't match the ASIO buffer size. This causes:
+When preparing the filter, the driver requests the sample rate with
+`node.rate = 1/sampleRate`, latency with `node.latency = frames/sampleRate`, and
+matching `node.force-quantum`/`node.force-rate`. These properties constrain the
+graph while the ASIO node is active. Stopping the stream deactivates the node;
+the driver does not write global `clock.force-*` metadata. Property meanings are
+documented in the [PipeWire key reference](https://docs.pipewire.org/group__pw__keys.html).
 
-- Callback timing errors (red bars in VBAsioTest)
-- Audio dropouts and glitches
-- Inconsistent latency
-- Poor performance with small buffer sizes (128 samples)
+If another graph constraint forces a different rate or quantum, PipeWine outputs
+silence until the match is restored. It does not process partial/doubled blocks,
+which previously changed audio pitch and tempo. A FIFO adapter is a future
+option, with additional latency and MIDI-offset handling required.
 
-## The Solution: GUI-Based Quantum Setting
+The control panel saves preferences. It does not run `pw-metadata`. A running
+stream keeps its original buffers and clock while requesting a host reset.
+Dispose/recreate buffers for size/rate changes; reopen the driver for channel or
+device changes. Sample rates must be supported, and cannot change in a prepared
+or running stream.
 
-The PipeWire ASIO driver now includes an intelligent quantum synchronization system that automatically configures PipeWire for optimal performance.
-
-### How It Works
-
-1. **GUI Integration**: When you save configuration in the ASIO control panel, the GUI automatically sets the PipeWire quantum to match your buffer size
-2. **Pre-Configuration**: The quantum is set before the driver initializes, ensuring perfect synchronization from the start
-3. **No Driver Overhead**: The driver no longer needs to make system calls during audio processing
-
-### Usage Methods
-
-#### Method 1: Automatic (Recommended)
-1. Open your DAW (e.g., Ableton Live)
-2. Go to ASIO driver settings and open the PipeWireASIO control panel
-3. Set your desired buffer size (e.g., 256 samples)
-4. Click "OK" to save - **the quantum is automatically set!**
-5. Restart your DAW for optimal performance
-
-#### Method 2: Manual Script
-```bash
-# Set quantum to 256 samples
-./set-pipewire-quantum.sh 256
-
-# Set quantum to 128 samples  
-./set-pipewire-quantum.sh 128
-
-# Set quantum to 512 samples
-./set-pipewire-quantum.sh 512
-```
-
-#### Method 3: Direct Command
-```bash
-# Set quantum manually
-pw-metadata -n settings 0 clock.quantum 256
-
-# Check current quantum
-pw-metadata -n settings | grep quantum
-```
-
-## Benefits
-
-- **Perfect Sync**: PipeWire quantum exactly matches ASIO buffer size
-- **Zero Timing Errors**: Eliminates callback timing mismatches
-- **Better Performance**: Especially noticeable with small buffer sizes (128-256 samples)
-- **Professional Reliability**: Consistent performance for audio production
-
-## Troubleshooting
-
-### If pw-metadata is not found:
-```bash
-# Fedora
-sudo dnf install pipewire-utils
-
-# Ubuntu/Debian  
-sudo apt install pipewire-utils
-```
-
-### If timing errors persist:
-1. Ensure quantum is set correctly: `pw-metadata -n settings | grep quantum`
-2. Restart your DAW after changing quantum
-3. Try the manual script: `./set-pipewire-quantum.sh [your_buffer_size]`
-
-## Technical Details
-
-The quantum setting tells PipeWire how many audio samples to process in each cycle. When this matches your ASIO buffer size:
-
-- **Audio callbacks are perfectly aligned**
-- **No buffer size conversion overhead**  
-- **Minimal latency and jitter**
-- **Optimal CPU usage**
-
-This revolutionary approach eliminates the timing issues that plagued earlier versions and provides professional-grade audio performance. 
+For dropouts, try a larger host buffer and inspect the graph using `pw-top`.
+Changing global PipeWire quantum metadata is generally unnecessary for this
+driver and can affect other applications. Compatibility with competing clients
+and actual hardware constraints should be verified on the target system.

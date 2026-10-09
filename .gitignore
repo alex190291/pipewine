@@ -55,3 +55,9 @@ Thumbs.db
 AGENT_TASK_*.md
 agent-*-findings.md
 REWORK.md
+
+# Compiler dependencies and regression binaries
+*.d
+*.exe.so
+tests/test_helper_regressions
+tests/test_gui_regressions

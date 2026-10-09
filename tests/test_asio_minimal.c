@@ -16,43 +16,7 @@
 #include <windows.h>
 #include <objbase.h>
 
-/* PipeWine CLSID */
-static const CLSID CLSID_PipeWine = {
-    0xA4262EE4, 0xC528, 0x4FF9,
-    {0x87, 0xBE, 0x56, 0x26, 0x1A, 0xD7, 0x92, 0xC3}
-};
-
-/* ASIO types */
-typedef long ASIOError;
-typedef long ASIOBool;
-typedef double ASIOSampleRate;
-
-#define ASE_OK 0
-#define ASIOTrue 1
-#define ASIOFalse 0
-
-/* Simplified ASIO interface */
-typedef struct {
-    HRESULT (__stdcall *QueryInterface)(void *this, REFIID riid, void **ppvObject);
-    ULONG (__stdcall *AddRef)(void *this);
-    ULONG (__stdcall *Release)(void *this);
-    ASIOBool (__stdcall *Init)(void *this, void *sysRef);
-    void (__stdcall *GetDriverName)(void *this, char *name);
-    LONG (__stdcall *GetDriverVersion)(void *this);
-    void (__stdcall *GetErrorMessage)(void *this, char *string);
-    ASIOError (__stdcall *Start)(void *this);
-    ASIOError (__stdcall *Stop)(void *this);
-    ASIOError (__stdcall *GetChannels)(void *this, LONG *numInputChannels, LONG *numOutputChannels);
-    ASIOError (__stdcall *GetLatencies)(void *this, LONG *inputLatency, LONG *outputLatency);
-    ASIOError (__stdcall *GetBufferSize)(void *this, LONG *minSize, LONG *maxSize, LONG *preferredSize, LONG *granularity);
-    ASIOError (__stdcall *CanSampleRate)(void *this, ASIOSampleRate sampleRate);
-    ASIOError (__stdcall *GetSampleRate)(void *this, ASIOSampleRate *sampleRate);
-    ASIOError (__stdcall *SetSampleRate)(void *this, ASIOSampleRate sampleRate);
-} IASIOVtbl;
-
-typedef struct {
-    IASIOVtbl *lpVtbl;
-} IASIO;
+#include "asio_test_api.h"
 
 /**
  * Test: COM initialization
@@ -99,6 +63,7 @@ void test_driver_creation(void) {
     IASIO *pASIO = NULL;
     hr = CoCreateInstance(&CLSID_PipeWine, NULL, CLSCTX_INPROC_SERVER,
                          &CLSID_PipeWine, (void**)&pASIO);
+    TEST_ASSERT(SUCCEEDED(hr) && pASIO, "Driver creation succeeds across COM reuse");
 
     TEST_ASSERT(SUCCEEDED(hr), "CoCreateInstance should succeed");
     TEST_ASSERT_NOT_NULL(pASIO, "ASIO driver pointer should be valid");
@@ -126,6 +91,7 @@ void test_driver_init(void) {
     IASIO *pASIO = NULL;
     hr = CoCreateInstance(&CLSID_PipeWine, NULL, CLSCTX_INPROC_SERVER,
                          &CLSID_PipeWine, (void**)&pASIO);
+    TEST_ASSERT(SUCCEEDED(hr) && pASIO, "Driver creation succeeds across COM reuse");
 
     if (FAILED(hr) || !pASIO) {
         printf("SKIP: Driver creation failed\n");
@@ -153,6 +119,7 @@ void test_driver_name(void) {
     IASIO *pASIO = NULL;
     hr = CoCreateInstance(&CLSID_PipeWine, NULL, CLSCTX_INPROC_SERVER,
                          &CLSID_PipeWine, (void**)&pASIO);
+    TEST_ASSERT(SUCCEEDED(hr) && pASIO, "Driver creation succeeds across COM reuse");
     if (FAILED(hr) || !pASIO) {
         CoUninitialize();
         return;
@@ -187,6 +154,7 @@ void test_channel_info(void) {
     IASIO *pASIO = NULL;
     hr = CoCreateInstance(&CLSID_PipeWine, NULL, CLSCTX_INPROC_SERVER,
                          &CLSID_PipeWine, (void**)&pASIO);
+    TEST_ASSERT(SUCCEEDED(hr) && pASIO, "Driver creation succeeds across COM reuse");
     if (FAILED(hr) || !pASIO) {
         CoUninitialize();
         return;
@@ -204,7 +172,7 @@ void test_channel_info(void) {
     TEST_ASSERT_EQ(ASE_OK, err, "GetChannels should return ASE_OK");
     TEST_ASSERT(inputs >= 0, "Input channels should be >= 0");
     TEST_ASSERT(outputs >= 0, "Output channels should be >= 0");
-    printf("  Channels: %ld inputs, %ld outputs\n", inputs, outputs);
+    printf("  Channels: %d inputs, %d outputs\n", inputs, outputs);
 
     pASIO->lpVtbl->Release(pASIO);
     CoUninitialize();
@@ -223,6 +191,7 @@ void test_sample_rate(void) {
     IASIO *pASIO = NULL;
     hr = CoCreateInstance(&CLSID_PipeWine, NULL, CLSCTX_INPROC_SERVER,
                          &CLSID_PipeWine, (void**)&pASIO);
+    TEST_ASSERT(SUCCEEDED(hr) && pASIO, "Driver creation succeeds across COM reuse");
     if (FAILED(hr) || !pASIO) {
         CoUninitialize();
         return;
@@ -258,6 +227,7 @@ void test_buffer_size_info(void) {
     IASIO *pASIO = NULL;
     hr = CoCreateInstance(&CLSID_PipeWine, NULL, CLSCTX_INPROC_SERVER,
                          &CLSID_PipeWine, (void**)&pASIO);
+    TEST_ASSERT(SUCCEEDED(hr) && pASIO, "Driver creation succeeds across COM reuse");
     if (FAILED(hr) || !pASIO) {
         CoUninitialize();
         return;
@@ -279,7 +249,7 @@ void test_buffer_size_info(void) {
     TEST_ASSERT(preferredSize >= minSize && preferredSize <= maxSize,
                 "Preferred size should be within range");
 
-    printf("  Buffer sizes: min=%ld, max=%ld, preferred=%ld, granularity=%ld\n",
+    printf("  Buffer sizes: min=%d, max=%d, preferred=%d, granularity=%d\n",
            minSize, maxSize, preferredSize, granularity);
 
     pASIO->lpVtbl->Release(pASIO);
@@ -299,6 +269,7 @@ void test_driver_release(void) {
     IASIO *pASIO = NULL;
     hr = CoCreateInstance(&CLSID_PipeWine, NULL, CLSCTX_INPROC_SERVER,
                          &CLSID_PipeWine, (void**)&pASIO);
+    TEST_ASSERT(SUCCEEDED(hr) && pASIO, "Driver creation succeeds across COM reuse");
 
     if (SUCCEEDED(hr) && pASIO) {
         pASIO->lpVtbl->Init(pASIO, NULL);

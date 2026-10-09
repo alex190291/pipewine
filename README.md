@@ -17,21 +17,21 @@ PipeWine is a high-performance ASIO (Audio Stream Input/Output) driver that enab
 
 ### 🎯 **Audio Performance**
 - **Low latency** audio processing capabilities
-- **Real-time audio processing** with dedicated Wine thread marshalling
-- **Professional buffer management** with cache-aligned allocation
-- **Manual quantum synchronization** (requires matching PipeWire and ASIO settings)
+- **Real-time audio processing** on a Wine-created PipeWire data thread
+- **Validated buffer management** with allocation failure cleanup
+- **Quantum/rate requests** scoped to the active ASIO node
 
 ### 🎛️ **Flexible Configuration**
-- **GUI control panel** (currently has issues, under development)
+- **GUI control panel** with safe modal lifetime and saved preferences
 - **File-based configuration** system (`pipewine.conf`)
-- **Real-time parameter changes** without application restart
+- **Configuration changes** saved safely; buffer/rate changes require host reset, channel/device changes require reopening
 - **Multiple configuration locations** (user and system-wide)
 
 ### 🔧 **Advanced Features**
-- **Dynamic sample rate switching** (44.1kHz, 48kHz, 96kHz, 192kHz) <- currently not working reliable
+- **Sample rate selection** (44.1kHz, 48kHz, 96kHz, 192kHz); dispose buffers before changing rate
 - **Configurable buffer sizes** (16-8192 samples, powers of 2)
 - **Multiple channel configurations** (up to 64 inputs/outputs)
-- **Automatic hardware connection** with device selection <- currently not working
+- **Automatic audio connections** to selected/default devices, with hot-plug reconnection
 - **Memory leak prevention** with comprehensive buffer management
 
 ### 🖥️ **Application Compatibility**
@@ -52,20 +52,29 @@ PipeWine is a high-performance ASIO (Audio Stream Input/Output) driver that enab
 git clone https://github.com/alex190291/pipewine.git
 cd pipewine
 
-# Build the driver
-make 64
-
-# Install with automatic setup
-sudo ./install-pipewine.sh
+# Build and install into ~/.wine (run without sudo)
+./install.sh
 ```
+
+The installer copies the 64-bit driver and control panel into the selected Wine
+prefix, registers PipeWine, and backs up replaced files under `.pipewine-backups`.
+It creates `<prefix>/pipewine-run`, which supplies Wine's driver search path, and
+updates existing `launch-ableton.sh` scripts under `drive_c/ProgramData/Ableton` to
+use it. Restart Ableton from its shortcut after installing.
+
+Use `./install.sh --prefix /path/to/prefix` for another prefix, `--no-build` to use
+an existing build, or `--wine /path/to/wine64` for a custom Wine runtime.
+The default prefix follows `WINEPREFIX`, falling back to `~/.wine`. System Wine
+and Proton installations are untouched. Other application launchers should use
+`<prefix>/pipewine-run` instead of `wine`; use `--no-ableton` to skip launcher edits.
 
 ### Basic Usage
 ```bash
 # Test the installation
-wine64 VBASIOTest64.exe
+~/.wine/pipewine-run VBASIOTest64.exe
 
 # Launch your DAW and select "PipeWine" as ASIO driver
-wine64 ~/.wine/drive_c/path/to/your/daw.exe
+~/.wine/pipewine-run ~/.wine/drive_c/path/to/your/daw.exe
 ```
 ## ⚙️ Configuration
 
@@ -92,11 +101,9 @@ auto_connect = true
 rt_priority = 10
 ```
 
-**Important**: After changing buffer_size in configuration, set PipeWire quantum to match:
-```bash
-# Set PipeWire quantum to match buffer size
-pw-metadata -n settings 0 clock.quantum 512
-```
+The driver requests matching quantum and rate while its ASIO node is active.
+The host can request another supported buffer size unless fixed buffer mode is enabled.
+See [quantum behavior](docs/QUANTUM_SYNC_GUIDE.md) for graph conflicts and reset requirements.
 
 ## ✨ Known Issues:
 You need to disable your DAW's audio engine, otherwise programs started after the DAW can't create PipeWire portals.
@@ -112,7 +119,7 @@ You need to disable your DAW's audio engine, otherwise programs started after th
 ### Performance Notes
 - Performance benchmarks are not yet available
 - Latency depends on buffer size configuration and PipeWire quantum settings
-- **Important**: PipeWire quantum must be manually set to match ASIO buffer size for optimal performance
+- The driver requests matching quantum/rate; competing graph constraints can temporarily cause silence
 
 ## 🛠️ Building from Source
 
@@ -147,21 +154,19 @@ make clean
 **Q: Driver not appearing in ASIO applications**
 ```bash
 # Re-register the driver
-wine64 regsvr32 pipewine64.dll
+./install.sh --no-build
 ```
+
+For a driver installed into a prefix, launch applications through its
+`pipewine-run` wrapper so Wine can find the driver and its control panel.
 
 **Q: High latency or audio dropouts**
-```bash
-# Set PipeWire quantum to match your ASIO buffer size
-# For 512 sample buffer:
-pw-metadata -n settings 0 clock.quantum 512
 
-# For 256 sample buffer:
-pw-metadata -n settings 0 clock.quantum 256
+Try a larger ASIO host buffer and inspect the graph with `pw-top`. The driver
+requests the host quantum while active. See [the quantum guide](docs/QUANTUM_SYNC_GUIDE.md).
 
-# Configure matching buffer size in pipewine.conf
-echo "buffer_size = 512" >> ~/.config/pipewine/pipewine.conf
-```
+For implementation fixes, validation, and further optimization opportunities,
+see [the driver review](docs/DRIVER_REVIEW.md).
 
 ## 🤝 Contributing
 
@@ -172,7 +177,7 @@ We welcome contributions!
 git clone https://github.com/alex190291/pipewine.git
 cd pipewine
 make 64
-./tests/run_tests.sh
+./tests/run_regressions.sh
 ```
 
 ### Code Style

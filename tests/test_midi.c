@@ -11,52 +11,13 @@
 
 #include "pw_asio_midi.h"
 
-static const CLSID CLSID_PipeWine = {
-    0xA4262EE4, 0xC528, 0x4FF9,
-    {0x87, 0xBE, 0x56, 0x26, 0x1A, 0xD7, 0x92, 0xC3}
-};
-
-/* ASIO types */
-typedef long ASIOError;
-typedef long ASIOBool;
-
-#define ASE_SUCCESS 0x3f4847a0L
-
-typedef struct {
-    HRESULT (__stdcall *QueryInterface)(void *self, REFIID riid, void **ppvObject);
-    ULONG (__stdcall *AddRef)(void *self);
-    ULONG (__stdcall *Release)(void *self);
-    ASIOBool (__stdcall *Init)(void *self, void *sysRef);
-    void (__stdcall *GetDriverName)(void *self, char *name);
-    long (__stdcall *GetDriverVersion)(void *self);
-    void (__stdcall *GetErrorMessage)(void *self, char *string);
-    ASIOError (__stdcall *Start)(void *self);
-    ASIOError (__stdcall *Stop)(void *self);
-    ASIOError (__stdcall *GetChannels)(void *self, long *numInputChannels, long *numOutputChannels);
-    ASIOError (__stdcall *GetLatencies)(void *self, long *inputLatency, long *outputLatency);
-    ASIOError (__stdcall *GetBufferSize)(void *self, long *minSize, long *maxSize, long *preferredSize, long *granularity);
-    ASIOError (__stdcall *CanSampleRate)(void *self, double sampleRate);
-    ASIOError (__stdcall *GetSampleRate)(void *self, double *sampleRate);
-    ASIOError (__stdcall *SetSampleRate)(void *self, double sampleRate);
-    ASIOError (__stdcall *GetClockSources)(void *self, void *clocks, long *numSources);
-    ASIOError (__stdcall *SetClockSource)(void *self, long reference);
-    ASIOError (__stdcall *GetSamplePosition)(void *self, void *sPos, void *tStamp);
-    ASIOError (__stdcall *GetChannelInfo)(void *self, void *info);
-    ASIOError (__stdcall *CreateBuffers)(void *self, void *bufferInfos, long numChannels, long bufferSize, void *callbacks);
-    ASIOError (__stdcall *DisposeBuffers)(void *self);
-    ASIOError (__stdcall *ControlPanel)(void *self);
-    ASIOError (__stdcall *Future)(void *self, long selector, void *opt);
-    ASIOError (__stdcall *OutputReady)(void *self);
-} IASIOVtbl;
-
-typedef struct {
-    IASIOVtbl *lpVtbl;
-} IASIO;
+#include "asio_test_api.h"
 
 static int create_driver(IASIO **out_driver) {
     HRESULT hr = CoCreateInstance(&CLSID_PipeWine, NULL, CLSCTX_INPROC_SERVER,
                                   &IID_IUnknown, (void **)out_driver);
     if (FAILED(hr)) {
+        printf("Driver creation failed: 0x%08x\n", (unsigned int)hr);
         return 0;
     }
     return *out_driver != NULL;

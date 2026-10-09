@@ -50,6 +50,12 @@ static HRESULT WINAPI CF_QueryInterface(LPCLASSFACTORY iface, REFIID riid, LPVOI
     FIXME("(%p, %s, %p) stub!\n", This, debugstr_guid(riid), ppobj); */
     if (ppobj == NULL)
         return E_POINTER;
+    *ppobj = NULL;
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IClassFactory)) {
+        iface->lpVtbl->AddRef(iface);
+        *ppobj = iface;
+        return S_OK;
+    }
     return E_NOINTERFACE;
 }
 
@@ -163,7 +169,11 @@ HRESULT WINAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID *ppv)
  */
 HRESULT WINAPI DllCanUnloadNow(void)
 {
-    return WINEASIO_CF.ref == 1 ? S_OK : S_FALSE;
+    /* Repeated COM unload/reload of this ELF builtin fails with
+     * CO_E_DLLNOTFOUND on Wine. Keep the module mapped for this process;
+     * driver instances still release
+     * their streams, threads, buffers and factory references independently. */
+    return S_FALSE;
 }
 
 /***********************************************************************

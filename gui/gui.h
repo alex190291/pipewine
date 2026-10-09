@@ -32,9 +32,9 @@ struct pwasio_gui_conf {
 	void *user;  /**< Client's state pointer (typically IWineASIOImpl*) */
 
 	/**
-	 * @brief Called when GUI wants to close
-	 * Called after apply_config if user confirmed. The application
-	 * should call pwasio_destroy_gui in response.
+	 * @brief Reserved callback from the former asynchronous API.
+	 * The modal API returns after the dialog closes; the caller then destroys
+	 * the returned handle. This callback is no longer invoked.
 	 */
 	void (*closed)(struct pwasio_gui_conf *gui);
 
@@ -54,7 +54,8 @@ struct pwasio_gui_conf {
 	bool cf_auto_connect;         /**< Auto-connect to hardware */
 };
 
-// The config must persist for as long as the GUI is live.
+// Runs modally and returns an owned handle after the dialog closes.
+// The config must persist until pwasio_destroy_gui releases that handle.
 GUI_API struct pwasio_gui *pwasio_init_gui(struct pwasio_gui_conf *conf);
 GUI_API void pwasio_destroy_gui(struct pwasio_gui *gui);
 

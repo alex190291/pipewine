@@ -17,69 +17,18 @@
 #include <unknwn.h>
 #include <string.h>
 
-static const CLSID CLSID_PipeWine = {
-    0xA4262EE4, 0xC528, 0x4FF9,
-    {0x87, 0xBE, 0x56, 0x26, 0x1A, 0xD7, 0x92, 0xC3}
-};
+#include "asio_test_api.h"
 
-/* ASIO types */
-typedef long ASIOError;
-typedef long ASIOBool;
-
-typedef struct ASIOBufferInfo {
-    ASIOBool isInput;
-    long channel;
-    void *buffers[2];
-} ASIOBufferInfo;
-
-typedef struct ASIOCallbacks {
-    void (*bufferSwitch)(long doubleBufferIndex, ASIOBool directProcess);
-    void (*sampleRateDidChange)(double sRate);
-    long (*asioMessage)(long selector, long value, void *message, double *opt);
-    void (*bufferSwitchTimeInfo)(void *params, long doubleBufferIndex, ASIOBool directProcess);
-} ASIOCallbacks;
-
-typedef struct {
-    HRESULT (__stdcall *QueryInterface)(void *self, REFIID riid, void **ppvObject);
-    ULONG (__stdcall *AddRef)(void *self);
-    ULONG (__stdcall *Release)(void *self);
-    ASIOBool (__stdcall *Init)(void *self, void *sysRef);
-    void (__stdcall *GetDriverName)(void *self, char *name);
-    long (__stdcall *GetDriverVersion)(void *self);
-    void (__stdcall *GetErrorMessage)(void *self, char *string);
-    ASIOError (__stdcall *Start)(void *self);
-    ASIOError (__stdcall *Stop)(void *self);
-    ASIOError (__stdcall *GetChannels)(void *self, long *numInputChannels, long *numOutputChannels);
-    ASIOError (__stdcall *GetLatencies)(void *self, long *inputLatency, long *outputLatency);
-    ASIOError (__stdcall *GetBufferSize)(void *self, long *minSize, long *maxSize, long *preferredSize, long *granularity);
-    ASIOError (__stdcall *CanSampleRate)(void *self, double sampleRate);
-    ASIOError (__stdcall *GetSampleRate)(void *self, double *sampleRate);
-    ASIOError (__stdcall *SetSampleRate)(void *self, double sampleRate);
-    ASIOError (__stdcall *GetClockSources)(void *self, void *clocks, long *numSources);
-    ASIOError (__stdcall *SetClockSource)(void *self, long reference);
-    ASIOError (__stdcall *GetSamplePosition)(void *self, void *sPos, void *tStamp);
-    ASIOError (__stdcall *GetChannelInfo)(void *self, void *info);
-    ASIOError (__stdcall *CreateBuffers)(void *self, ASIOBufferInfo *bufferInfos, long numChannels, long bufferSize, ASIOCallbacks *callbacks);
-    ASIOError (__stdcall *DisposeBuffers)(void *self);
-    ASIOError (__stdcall *ControlPanel)(void *self);
-    ASIOError (__stdcall *Future)(void *self, long selector, void *opt);
-    ASIOError (__stdcall *OutputReady)(void *self);
-} IASIOVtbl;
-
-typedef struct {
-    IASIOVtbl *lpVtbl;
-} IASIO;
-
-static void bufferSwitch(long doubleBufferIndex, ASIOBool directProcess) {
+static void ASIO_CALLBACK bufferSwitch(LONG doubleBufferIndex, ASIOBool directProcess) {
     (void)doubleBufferIndex;
     (void)directProcess;
 }
 
-static void sampleRateDidChange(double sRate) {
+static void ASIO_CALLBACK sampleRateDidChange(double sRate) {
     (void)sRate;
 }
 
-static long asioMessage(long selector, long value, void *message, double *opt) {
+static LONG ASIO_CALLBACK asioMessage(LONG selector, LONG value, void *message, double *opt) {
     (void)selector;
     (void)value;
     (void)message;
@@ -87,16 +36,18 @@ static long asioMessage(long selector, long value, void *message, double *opt) {
     return 0;
 }
 
-static void bufferSwitchTimeInfo(void *params, long doubleBufferIndex, ASIOBool directProcess) {
+static ASIOTime * ASIO_CALLBACK bufferSwitchTimeInfo(ASIOTime *params, LONG doubleBufferIndex, ASIOBool directProcess) {
     (void)params;
     (void)doubleBufferIndex;
     (void)directProcess;
+    return params;
 }
 
 static int create_driver(IASIO **out_driver) {
     HRESULT hr = CoCreateInstance(&CLSID_PipeWine, NULL, CLSCTX_INPROC_SERVER,
                                   &IID_IUnknown, (void **)out_driver);
     if (FAILED(hr)) {
+        printf("Driver creation failed: 0x%08x\n", (unsigned int)hr);
         return 0;
     }
     return *out_driver != NULL;
@@ -139,17 +90,17 @@ static void test_buffer_creation(void) {
         return;
     }
 
-    long minSize = 0, maxSize = 0, preferredSize = 0, granularity = 0;
+    LONG minSize = 0, maxSize = 0, preferredSize = 0, granularity = 0;
     ASIOError err = driver->lpVtbl->GetBufferSize(driver, &minSize, &maxSize, &preferredSize, &granularity);
     TEST_ASSERT_EQ(0, err, "GetBufferSize should succeed");
 
     ASIOBufferInfo bufferInfos[2];
     bufferInfos[0].isInput = 1;
-    bufferInfos[0].channel = 0;
+    bufferInfos[0].channelNum = 0;
     bufferInfos[0].buffers[0] = NULL;
     bufferInfos[0].buffers[1] = NULL;
     bufferInfos[1].isInput = 0;
-    bufferInfos[1].channel = 0;
+    bufferInfos[1].channelNum = 0;
     bufferInfos[1].buffers[0] = NULL;
     bufferInfos[1].buffers[1] = NULL;
 
@@ -198,15 +149,15 @@ static void test_buffer_restart_clears(void) {
         return;
     }
 
-    long minSize = 0, maxSize = 0, preferredSize = 0, granularity = 0;
+    LONG minSize = 0, maxSize = 0, preferredSize = 0, granularity = 0;
     ASIOError err = driver->lpVtbl->GetBufferSize(driver, &minSize, &maxSize, &preferredSize, &granularity);
     TEST_ASSERT_EQ(0, err, "GetBufferSize should succeed");
 
     ASIOBufferInfo bufferInfos[2];
     bufferInfos[0].isInput = 0;
-    bufferInfos[0].channel = 0;
+    bufferInfos[0].channelNum = 0;
     bufferInfos[1].isInput = 0;
-    bufferInfos[1].channel = 1;
+    bufferInfos[1].channelNum = 1;
     bufferInfos[0].buffers[0] = NULL;
     bufferInfos[0].buffers[1] = NULL;
     bufferInfos[1].buffers[0] = NULL;
@@ -256,15 +207,15 @@ static void test_buffer_validation(void) {
         return;
     }
 
-    long minSize = 0, maxSize = 0, preferredSize = 0, granularity = 0;
+    LONG minSize = 0, maxSize = 0, preferredSize = 0, granularity = 0;
     ASIOError err = driver->lpVtbl->GetBufferSize(driver, &minSize, &maxSize, &preferredSize, &granularity);
     TEST_ASSERT_EQ(0, err, "GetBufferSize should succeed");
 
     ASIOBufferInfo bufferInfos[2];
     bufferInfos[0].isInput = 1;
-    bufferInfos[0].channel = 0;
+    bufferInfos[0].channelNum = 0;
     bufferInfos[1].isInput = 0;
-    bufferInfos[1].channel = 0;
+    bufferInfos[1].channelNum = 0;
     bufferInfos[0].buffers[0] = NULL;
     bufferInfos[0].buffers[1] = NULL;
     bufferInfos[1].buffers[0] = NULL;

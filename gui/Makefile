@@ -39,11 +39,9 @@ $(if $(wildcard $(UIC)),,$(error UIC not found at $(UIC)))
 $(if $(wildcard $(MOC)),,$(error MOC not found at $(MOC)))
 
 # Main target
-$(BUILD_DIR)/libpwasio_gui.so: $(BUILD_DIR)/dialog.o $(BUILD_DIR)/device_selector.o $(BUILD_DIR)/device_chooser.o $(BUILD_DIR)/gui.o
+$(BUILD_DIR)/libpwasio_gui.so: $(BUILD_DIR)/dialog.o $(BUILD_DIR)/device_selector.o $(BUILD_DIR)/device_chooser.o $(BUILD_DIR)/gui.o $(BUILD_DIR)/pw_helper.o $(BUILD_DIR)/pw_config_utils.o
 	@$(shell mkdir -p $(BUILD_DIR))
-	$(CXX) -o $@ $(LFLAGS) $^ \
-		$(if $(wildcard $(BUILD_DIR)/pw_helper.o),$(BUILD_DIR)/pw_helper.o) \
-		$(if $(wildcard $(BUILD_DIR)/pw_config_utils.o),$(BUILD_DIR)/pw_config_utils.o)
+	$(CXX) -o $@ $^ $(LFLAGS)
 
 # Dependencies
 $(BUILD_DIR)/dialog.o: dialog.cpp dialog.moc ui_dialog.hpp
@@ -54,7 +52,7 @@ $(BUILD_DIR)/gui.o: gui.cpp
 # Object file compilation
 $(BUILD_DIR)/%.o: %.cpp
 	@$(shell mkdir -p $(BUILD_DIR))
-	$(CXX) -c -o $@ $(CXXFLAGS) $(QT_CFLAGS) $(PW_CFLAGS) $<
+	$(CXX) -c -o $@ $(CXXFLAGS) $(QT_CFLAGS) $(PW_CFLAGS) -MMD -MP $<
 
 # MOC file generation
 %.moc: %.hpp
@@ -68,4 +66,5 @@ ui_%.hpp: %.ui
 clean:
 	rm -f *.moc ui_*.hpp $(BUILD_DIR)/*.o $(BUILD_DIR)/libpwasio_gui.so
 
-.PHONY: clean 
+.PHONY: clean
+-include $(COMMON_OBJS:%.o=$(BUILD_DIR)/%.d) $(BUILD_DIR)/gui.d

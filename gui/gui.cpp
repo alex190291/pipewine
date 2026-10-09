@@ -15,6 +15,9 @@ struct pwasio_gui {
 	struct pwasio_gui_conf *conf;
 	PwAsioDialog *dialog;
 	QApplication *app;
+	int argc = 1;
+	char appName[16] = "pipewine";
+	char *argv[2] = {appName, nullptr};
 	
 	pwasio_gui(struct pwasio_gui_conf *conf) 
 		: conf(conf), dialog(nullptr), app(nullptr) {}
@@ -37,9 +40,7 @@ struct pwasio_gui *pwasio_init_gui(struct pwasio_gui_conf *conf) {
 	
 	// Create QApplication if it doesn't exist
 	if (!QApplication::instance()) {
-		int argc = 0;
-		char *argv[] = {nullptr};
-		gui->app = new QApplication(argc, argv);
+		gui->app = new QApplication(gui->argc, gui->argv);
 		gui->app->setApplicationName("PipeWire ASIO Settings");
 	}
 	
@@ -59,19 +60,11 @@ struct pwasio_gui *pwasio_init_gui(struct pwasio_gui_conf *conf) {
 		if (gui->conf->apply_config) {
 			gui->conf->apply_config(gui->conf);
 		}
-		// Notify that GUI is closing
-		if (gui->conf->closed) {
-			gui->conf->closed(gui->conf);
-		}
 	});
-	
-	QObject::connect(gui->dialog, &QDialog::rejected, [gui]() {
-		// User cancelled - just notify close
-		if (gui->conf->closed) {
-			gui->conf->closed(gui->conf);
-		}
-	});
-	
+
+	// exec() owns the modal lifetime. The caller destroys the GUI only after
+	// it returns; deleting the dialog in accepted/rejected is unsafe.
+
 	// Load current configuration
 	if (gui->conf->load_config) {
 		gui->conf->load_config(gui->conf);

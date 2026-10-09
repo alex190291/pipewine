@@ -83,6 +83,14 @@ void user_pw_lock_loop(struct user_pw_helper *helper);
  */
 void user_pw_unlock_loop(struct user_pw_helper *helper);
 
+/** Configure owned audio links for an ASIO filter. Empty device names use
+ * the defaults. Selected channels map in port order; MIDI ports are excluded.
+ * Registry/metadata events reconnect devices without polling. SPA_ID_INVALID
+ * clears all owned links, leaving manually created links alone. */
+void user_pw_configure_audio_connections(struct user_pw_helper *helper, uint32_t node,
+                                        const char *source, const char *sink,
+                                        uint64_t inputs, uint64_t outputs);
+
 // Device hot-plug monitoring (Task 3.1)
 typedef void (*user_pw_device_callback_t)(struct pw_node *node, int added, void *userdata);
 

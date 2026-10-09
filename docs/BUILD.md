@@ -44,9 +44,24 @@ make -C gui
 ## Installation
 
 ```bash
-sudo make install64
-wine64 regsvr32 pipewine64.dll
+./install.sh
 ```
+
+Run as your normal user. This builds and installs the 64-bit driver and control
+panel into `WINEPREFIX` (default `~/.wine`), registers the driver, and saves backups
+under `<prefix>/.pipewine-backups`. No system Wine or Proton files are modified.
+
+To reuse a build or select another Wine prefix/runtime:
+
+```bash
+./install.sh --no-build --prefix /path/to/prefix --wine /path/to/wine64
+```
+
+Launch applications using `<prefix>/pipewine-run /path/to/application.exe`.
+This wrapper supplies the prefix's driver search path, which is required for
+loading this ELF-based Wine driver with current system Wine. Existing Ableton
+`launch-ableton.sh` scripts in the prefix are updated automatically; restart
+Ableton from its shortcut after installation. Use `--no-ableton` to skip those edits.
 
 ## Troubleshooting
 

@@ -62,37 +62,43 @@ bool pw_asio_is_valid_sample_rate(uint32_t rate) {
 
 // --- Configuration Path Resolution ---
 
-char *pw_asio_get_config_path(void) {
-    char *path = NULL;
+static char *user_config_directory(void) {
+    const char *xdg_config = getenv("XDG_CONFIG_HOME");
     const char *home = getenv("HOME");
+    char *directory;
+    if (xdg_config && xdg_config[0] == '/') {
+        size_t length = strlen(xdg_config) + sizeof("/pipewine");
+        directory = (char *)malloc(length);
+        if (directory) snprintf(directory, length, "%s/pipewine", xdg_config);
+    } else if (home && *home) {
+        size_t length = strlen(home) + sizeof("/.config/pipewine");
+        directory = (char *)malloc(length);
+        if (directory) snprintf(directory, length, "%s/.config/pipewine", home);
+    } else return NULL;
+    return directory;
+}
 
-    // Try user config first (higher priority)
-    if (home) {
-        size_t len = strlen(home) + 40;
-        path = (char *)malloc(len);
+char *pw_asio_get_config_path(void) {
+    char *directory = user_config_directory();
+    if (directory) {
+        size_t length = strlen(directory) + sizeof("/pipewine.conf");
+        char *path = (char *)malloc(length);
         if (path) {
-            snprintf(path, len, "%s/.config/pipewine/pipewine.conf", home);
-            FILE *f = fopen(path, "r");
-            if (f) {
-                fclose(f);
+            snprintf(path, length, "%s/pipewine.conf", directory);
+            FILE *file = fopen(path, "r");
+            if (file) {
+                fclose(file);
+                free(directory);
                 return path;
             }
             free(path);
         }
+        free(directory);
     }
-
-    // Try system config
-    path = strdup("/etc/pipewine/pipewine.conf");
-    if (path) {
-        FILE *f = fopen(path, "r");
-        if (f) {
-            fclose(f);
-            return path;
-        }
-        free(path);
-    }
-
-    return NULL;
+    FILE *file = fopen("/etc/pipewine/pipewine.conf", "r");
+    if (!file) return NULL;
+    fclose(file);
+    return strdup("/etc/pipewine/pipewine.conf");
 }
 
 // Helper function to create directory recursively
@@ -131,29 +137,17 @@ static int mkdir_recursive(const char *path) {
 }
 
 char *pw_asio_get_user_config_path(void) {
-    const char *home = getenv("HOME");
-    if (!home) return NULL;
-
-    size_t len = strlen(home) + 40;
-    char *dir_path = (char *)malloc(len);
-    char *file_path = (char *)malloc(len);
-
-    if (!dir_path || !file_path) {
-        free(dir_path);
-        free(file_path);
+    char *directory = user_config_directory();
+    if (!directory) return NULL;
+    if (mkdir_recursive(directory) != 0) {
+        free(directory);
         return NULL;
     }
-
-    snprintf(dir_path, len, "%s/.config/pipewine", home);
-    snprintf(file_path, len, "%s/pipewine.conf", dir_path);
-
-    // Create directory if it doesn't exist (using proper mkdir instead of system())
-    if (mkdir_recursive(dir_path) != 0) {
-        fprintf(stderr, "Warning: Failed to create config directory: %s\n", dir_path);
-    }
-
-    free(dir_path);
-    return file_path;
+    size_t length = strlen(directory) + sizeof("/pipewine.conf");
+    char *path = (char *)malloc(length);
+    if (path) snprintf(path, length, "%s/pipewine.conf", directory);
+    free(directory);
+    return path;
 }
 
 // --- Logging Functions ---

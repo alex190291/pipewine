@@ -24,9 +24,12 @@ they do not establish latency or CPU improvements on a physical audio interface.
   prevented audio links from allocating buffers.
 - The filter requests `node.rate = 1/sampleRate`, the matching latency, quantum,
   and rate. Constraints apply while its node is active. The filter starts
-  inactive; `ASIOStart` initializes state before activation. A transitional or
-  externally forced rate/quantum mismatch produces silence rather than altered
-  pitch/tempo. Competing graph constraints can still prevent matching settings.
+  inactive; `ASIOStart` initializes state before activation. The callback checks
+  negotiated graph timing before processing audio. The previously reported
+  graph rate/quantum conflict issue is fixed.
+- The previously reported DAW/portal interaction is fixed; disabling the DAW's
+  audio engine to let subsequently started applications create portals is no
+  longer required.
 - Selected devices now create actual owned audio links. Empty device names use
   PipeWire's defaults. Active ASIO channels and device audio ports pair in port
   order, up to the smaller count; MIDI ports are excluded. Registry/metadata
@@ -79,7 +82,7 @@ latency gain is claimed without a comparative hardware benchmark.
 | Priority | Candidate | Evidence and validation needed |
 | --- | --- | --- |
 | High | Batch MIDI queue operations | Current code takes a mutex per event. Lock once per bounded batch, or use SPSC queues only after enforcing a single producer/consumer. Measure dense-MIDI loss and callback duration. |
-| High | Quantum adapter | Current fixed-buffer contract silences mismatches. Preallocated FIFOs could preserve audio with competing clients/quantums; account for added latency and MIDI offsets, and test both larger and smaller graph blocks. |
+| Medium | Optional quantum adapter | Preallocated FIFOs could support a wider range of graph block sizes; account for added latency and MIDI offsets, and test both larger and smaller graph blocks. |
 | Medium | Compact active-channel lists | Input scans all configured channels; output also silences inactive published ports. Cache selected input pointers and evaluate publishing only selected output ports. Benchmark 2 active channels out of 64. |
 | Medium | Stable endpoint snapshots | GUI endpoint arrays still expose borrowed proxies. Replace them with IDs and copied properties before adding more hot-plug UI features; stress removal while a chooser is open. |
 | Medium | Callback/graph profiling | Collect bounded counters/histograms without RT printing. Compare deadline misses and callback percentiles at 64/128/256 frames with audio and MIDI load. |
@@ -101,7 +104,7 @@ GUI reopen/close, registered DLL loading and repeated COM reuse, selected-device
 audio, hot-plug reconnection, callback Wine
 thread identity, and stop/restart with a deliberately slow callback.
 
-Physical interface latency, long DAW sessions, 32-bit builds, and the previously
-reported DAW/portal interaction still need dedicated validation. The known portal
-issue remains documented until it is reproduced and resolved on the affected
-setup.
+Physical interface latency, long DAW sessions, and 32-bit builds still need
+dedicated validation. The DAW/portal and graph rate/quantum conflict issues have
+been confirmed fixed by the user; this confirmation is separate from the
+automated regression checks above.

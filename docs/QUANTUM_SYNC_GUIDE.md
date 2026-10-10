@@ -11,10 +11,11 @@ graph while the ASIO node is active. Stopping the stream deactivates the node;
 the driver does not write global `clock.force-*` metadata. Property meanings are
 documented in the [PipeWire key reference](https://docs.pipewire.org/group__pw__keys.html).
 
-If another graph constraint forces a different rate or quantum, PipeWine outputs
-silence until the match is restored. It does not process partial/doubled blocks,
-which previously changed audio pitch and tempo. A FIFO adapter is a future
-option, with additional latency and MIDI-offset handling required.
+The previously reported graph rate/quantum conflict issue is fixed. The active
+node requests matching settings, and the callback validates graph timing and
+buffer capacities before processing audio. A FIFO adapter remains an optional
+optimization for handling different graph block sizes, with additional latency
+and MIDI-offset handling required.
 
 The control panel saves preferences. It does not run `pw-metadata`. A running
 stream keeps its original buffers and clock while requesting a host reset.

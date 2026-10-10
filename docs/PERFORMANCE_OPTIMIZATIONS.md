@@ -16,5 +16,5 @@ in this repository. Earlier numerical latency claims and aggressive compiler
 flag examples were not evidence of measured implementation behavior.
 
 See [the driver review](DRIVER_REVIEW.md) for reproducible regression checks and
-prioritized follow-ups: MIDI batching, a quantum adapter, active-channel lists,
+prioritized follow-ups: MIDI batching, an optional quantum adapter, active-channel lists,
 endpoint snapshots, and callback profiling.

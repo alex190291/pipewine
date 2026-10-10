@@ -134,7 +134,7 @@ The driver requests matching quantum and rate while its ASIO node is active.
 The host can request another supported buffer size unless fixed buffer mode is enabled.
 Buffer/rate changes require a host reset; channel/device changes require reopening
 the driver. Hosts must dispose existing buffers before changing the sample rate.
-See [quantum behavior](docs/QUANTUM_SYNC_GUIDE.md) for graph conflicts.
+See [quantum behavior](docs/QUANTUM_SYNC_GUIDE.md) for buffer and rate handling.
 
 ### Environment Overrides
 
@@ -160,10 +160,12 @@ PIPEWIREASIO_SAMPLE_RATE=48000 PIPEWIREASIO_BUFFER_SIZE=256 \
 
 ## ✨ Known Issues and Limits
 
-- **DAW/portal interaction:** You need to disable your DAW's audio engine, otherwise programs started after the DAW can't create PipeWire portals. This reported issue remains unresolved on the affected setup.
-- **Graph conflicts:** If PipeWire's rate or quantum differs from the ASIO request, the driver outputs silence until they match.
 - **MIDI:** The driver-specific extension handles messages of at most four bytes. Larger payloads, including SysEx, are discarded. Audio auto-connect does not route MIDI ports.
 - **Validation scope:** Physical-device latency, long DAW sessions, and 32-bit builds need separate testing.
+
+The previously reported DAW/portal interaction and graph rate/quantum conflict
+issues are fixed. Disabling the DAW's audio engine to allow other applications
+to create PipeWire portals is no longer required.
 
 ## 🎵 Audio Applications
 
@@ -182,7 +184,7 @@ with every DAW or hardware interface.
 
 - Performance benchmarks are not yet available
 - Latency depends on buffer size configuration and PipeWire quantum settings
-- The driver requests matching quantum/rate; competing graph constraints can temporarily cause silence
+- The driver requests matching quantum and sample rate while its ASIO node is active
 
 ## 🛠️ Building from Source
 
